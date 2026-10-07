@@ -22,6 +22,8 @@ services:
     volumes:
       - ./src:/app/src
       - ./scripts:/app/scripts
+      - ./tests:/app/tests
+      - ./manage.py:/app/manage.py
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

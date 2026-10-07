@@ -1,6 +1,11 @@
+import logging
+
 from django.http import JsonResponse
 from rest_framework.exceptions import APIException
+from rest_framework.response import Response
 from rest_framework.views import exception_handler
+
+logger = logging.getLogger(__name__)
 
 
 class DomainError(APIException):
@@ -18,7 +23,21 @@ class DomainError(APIException):
 def json_exception_handler(exc, context):
     response = exception_handler(exc, context)
     if response is None:
-        return None
+        logger.error(
+            "unhandled_api_exception",
+            exc_info=(type(exc), exc, exc.__traceback__),
+            extra={"operation": "api_request"},
+        )
+        return Response(
+            {
+                "error": {
+                    "code": "internal_error",
+                    "message": "An unexpected error occurred.",
+                    "retryable": True,
+                }
+            },
+            status=500,
+        )
     if isinstance(exc, DomainError):
         error = {
             "code": exc.code,
@@ -35,6 +54,19 @@ def json_exception_handler(exc, context):
     message = "Invalid request." if code == "validation_error" else str(exc)
     response.data = {"error": {"code": code, "message": message, "retryable": False}}
     return response
+
+
+def api_not_found(request, exception=None):
+    return JsonResponse(
+        {
+            "error": {
+                "code": "not_found",
+                "message": "API resource not found.",
+                "retryable": False,
+            }
+        },
+        status=404,
+    )
 
 
 def unavailable():

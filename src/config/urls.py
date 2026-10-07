@@ -1,5 +1,6 @@
-from django.urls import path
+from django.urls import path, re_path
 
+from config.errors import api_not_found
 from store.api import views
 from store.api.health import live, ready
 
@@ -19,4 +20,5 @@ urlpatterns = [
     path("api/v1/admin/coupons/generate", views.coupon_generate),
     path("api/v1/admin/coupons", views.coupon_list),
     path("api/v1/admin/reports/summary", views.report_summary),
+    re_path(r"^api/v1(?:/.*)?$", api_not_found),
 ]

@@ -16,7 +16,9 @@ class JsonFormatter(logging.Formatter):
         identifier = request_id.get()
         if identifier:
             payload["request_id"] = identifier
-        for name in ("path", "status"):
+        for name in ("path", "status", "attempt_id", "operation"):
             if hasattr(record, name):
                 payload[name] = getattr(record, name)
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload)

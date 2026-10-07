@@ -3,8 +3,8 @@ import os
 import signal
 import threading
 
-from django.core.management.base import BaseCommand
-from django.db import connections
+from django.core.management.base import BaseCommand, CommandError
+from django.db import DatabaseError, connections
 
 from store.services.worker import run_cycle
 
@@ -36,7 +36,17 @@ class Command(BaseCommand):
         logger.info("worker_started")
         try:
             while not stopping.is_set():
-                outcomes = run_cycle(attempt_id=options["attempt_id"])
+                try:
+                    outcomes = run_cycle(attempt_id=options["attempt_id"])
+                except DatabaseError as exc:
+                    logger.exception(
+                        "worker_cycle_database_error", extra={"operation": "payment_cycle"}
+                    )
+                    connections.close_all()
+                    if options["once"]:
+                        raise CommandError("Payment worker database operation failed.") from exc
+                    stopping.wait(options["poll_seconds"])
+                    continue
                 self.stdout.write(f"Processed {len(outcomes)} payment attempt(s): {outcomes}")
                 connections.close_all()
                 if options["once"]:

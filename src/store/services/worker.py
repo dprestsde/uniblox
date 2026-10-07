@@ -2,7 +2,7 @@ import logging
 import uuid
 from datetime import timedelta
 
-from django.db import transaction
+from django.db import DatabaseError, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -137,8 +137,20 @@ def process_claim(claim, provider=None, now=None):
         _finish_lease(attempt_id, token)
         return "confirmed" if result_status == PaymentStatus.SUCCEEDED else "failed"
     except Exception as exc:  # recovery must retain the known provider result
-        logger.exception("payment_attempt_processing_failed", extra={"attempt_id": str(attempt_id)})
-        _reschedule(attempt_id, token, str(exc), now)
+        logger.exception(
+            "payment_attempt_processing_failed",
+            extra={"attempt_id": str(attempt_id), "operation": "process_payment_attempt"},
+        )
+        try:
+            _reschedule(attempt_id, token, str(exc), now)
+        except DatabaseError:
+            logger.exception(
+                "payment_attempt_reschedule_failed",
+                extra={"attempt_id": str(attempt_id), "operation": "reschedule"},
+            )
+            raise
+        if isinstance(exc, DatabaseError):
+            raise
         return "retry"
 
 

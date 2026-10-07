@@ -32,6 +32,7 @@ services:
   worker:
     build: .
     command: ["python", "manage.py", "run_worker"]
+    restart: unless-stopped
     env_file: .env
     environment:
       PYTHONPATH: /app/src

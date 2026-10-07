@@ -1,6 +1,6 @@
 # Edge Cases and Verification Context
 
-This is the acceptance map for `task.md`. `tests/test_commerce.py` uses PostgreSQL `TransactionTestCase`; `tests/test_foundation.py` covers infrastructure. `make demo` exercises independent provider persistence and recovery faults.
+This is the acceptance map for `task.md`. `tests/test_commerce.py` uses PostgreSQL `TransactionTestCase`; `tests/test_foundation.py` covers infrastructure; `tests/test_api_architecture.py` covers serializer and layer contracts. `make demo` exercises independent provider persistence and recovery faults.
 
 ## Verified automated behavior
 
@@ -27,10 +27,15 @@ This is the acceptance map for `task.md`. `tests/test_commerce.py` uses PostgreS
 | Database routing | Provider and application aliases use distinct databases and routing | `DatabaseConfigurationTests` |
 | API errors/logs | Malformed and unknown API paths use JSON; unexpected failures are hidden from clients; logs retain safe diagnostics | `test_api_fallbacks_return_json_envelopes`, `test_unexpected_exception_is_logged_and_hidden`, `test_json_logs_include_safe_context_and_exception` |
 | Health/worker | Readiness fails generically; continuous mode recovers from a database error; one-cycle mode fails visibly | `test_readiness_hides_database_errors`, `test_continuous_worker_recovers_after_database_failure`, `test_once_worker_reports_database_failure`, `make worker-once` |
+| Serializer input | Unknown/read-only fields, malformed UUIDs, booleans, fractions, nonpositive quantities, invalid pagination, and missing keys fail before service calls | `SerializerTests` |
+| Service delegation | Command serializer `.save()` invokes the injected service with normalized validated values | `SerializerTests` |
+| Output contracts | Nested DTOs are response-validated; invalid service output is logged and returned as a safe 500 | `ApiArchitectureTests.test_invalid_service_output_returns_safe_internal_error` |
+| API compatibility | APIViews preserve customer, product, cart, order, coupon, report, replay, and error contracts | `ApiArchitectureTests`, `test_public_read_and_cart_endpoints_preserve_contracts` |
+| Layer boundary | API views and runtime commands have no direct model or transaction access; legacy procedural service modules are absent | `ApiArchitectureTests.test_runtime_entrypoints_do_not_use_orm_or_transactions` |
 
 ## Enforced by service and database constraints
 
-The API rejects unknown customers, products, carts, coupons, empty carts, zero/negative/fractional quantities, frozen-cart edits, and totals beyond the supported bound. Cart updates use absolute quantities; repeated deletion from an open cart is harmless. Cart additions use current availability without reserving, while checkout rechecks inside its transaction.
+DRF serializers reject malformed client-controlled values and report field-specific details before calling a service. Services independently reject unknown customers, products, carts, coupons, empty carts, frozen-cart edits, stale availability, and totals beyond the supported bound inside their transaction boundaries. Cart updates use absolute quantities; repeated deletion from an open cart is harmless. Cart additions use current availability without reserving, while checkout rechecks inside its transaction.
 
 Conditional uniqueness enforces one open cart per customer. Unique constraints enforce one order per cart, one reservation and payment attempt per order, one product line per cart/order, one idempotency operation/scope/key, and one coupon per reward milestone. Check constraints enforce positive quantities, balanced nonnegative money, valid percentages, and inventory/coupon state ownership.
 

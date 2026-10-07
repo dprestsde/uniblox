@@ -20,14 +20,14 @@ class HealthTests(SimpleTestCase):
         self.client = APIClient()
 
     def test_liveness_does_not_require_database(self):
-        with patch("store.api.health.connections") as databases:
+        with patch("store.services.health.connections") as databases:
             response = self.client.get("/health/live")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "live"})
         databases.__getitem__.assert_not_called()
 
     def test_readiness_hides_database_errors(self):
-        with patch("store.api.health.connections") as databases:
+        with patch("store.services.health.connections") as databases:
             databases.__getitem__.side_effect = OSError("private database detail")
             response = self.client.get("/health/ready")
         self.assertEqual(response.status_code, 503)
@@ -39,6 +39,7 @@ class HealthTests(SimpleTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data["error"]["code"], "validation_error")
         self.assertFalse(response.data["error"]["retryable"])
+        self.assertIn("details", response.data["error"])
 
     def test_api_fallbacks_return_json_envelopes(self):
         malformed = self.client.get("/api/v1/customers/not-a-uuid")
@@ -61,7 +62,7 @@ class HealthTests(SimpleTestCase):
         except ValueError:
             exc_info = sys.exc_info()
         record = logging.LogRecord(
-            "store.services.worker",
+            "store.services.payment",
             logging.ERROR,
             __file__,
             1,
@@ -94,13 +95,13 @@ class WorkerCommandTests(SimpleTestCase):
 
     @patch("store.management.commands.run_worker.signal.signal")
     @patch("store.management.commands.run_worker.threading.Event", new=TwoCycleEvent)
-    @patch("store.management.commands.run_worker.run_cycle")
+    @patch("store.management.commands.run_worker.PaymentService.run_cycle")
     def test_continuous_worker_recovers_after_database_failure(self, run_cycle, signal_mock):
         run_cycle.side_effect = [DatabaseError("database unavailable"), []]
         call_command("run_worker", poll_seconds=0.01)
         self.assertEqual(run_cycle.call_count, 2)
 
-    @patch("store.management.commands.run_worker.run_cycle")
+    @patch("store.management.commands.run_worker.PaymentService.run_cycle")
     def test_once_worker_reports_database_failure(self, run_cycle):
         run_cycle.side_effect = DatabaseError("database unavailable")
         with self.assertRaises(CommandError):

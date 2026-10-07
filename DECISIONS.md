@@ -1,6 +1,6 @@
 # Architecture Decisions
 
-Detailed rationale and earlier research live in [DECISION_CONTEXT.md](DECISION_CONTEXT.md). The implementation is constrained to the assignment’s 4–6-hour timebox.
+Detailed rationale and earlier research live in [DECISION_CONTEXT.md](DECISION_CONTEXT.md). The initial implementation followed the assignment’s 4–6-hour timebox; the requested API architecture hardening was completed afterward.
 
 ## Invariants and selected semantics
 
@@ -98,11 +98,21 @@ Cart additions increase the existing line and reject a resulting quantity above 
 
 **Consequences:** Configuration changes and multiple reward programs are deferred. Reports verify revenue and coupon accounting but do not repair inconsistencies.
 
+## Decision: DRF contracts and class-based domain services
+
+**Context:** Request validation, HTTP behavior, and database coordination need clear ownership that can be tested independently.
+
+**Choice:** Route every endpoint through an explicit DRF `APIView`, plain command and response serializers, then an injected class-based service. Command serializers validate body, path, query, and header values and delegate from `create()` or `update()`. Response serializers validate service DTOs. Services own all ORM access, transactions, locks, and database-dependent validation; workers and commands call the same services. Service errors are framework-independent.
+
+**Why:** Client-controlled values fail before persistence, output contracts cannot silently drift, and all entry points reuse the same concurrency-safe behavior.
+
+**Consequences:** Some rules are deliberately checked twice: serializers enforce request shape while services recheck mutable database state inside transactions. Invalid internal DTOs are logged and returned as safe 500 errors.
+
 ## Errors, implementation scope, and validation
 
-Errors use `{error: {code, message, retryable, details?}}`: 400 invalid input, JSON 404 for malformed or unknown API paths, 409 stock/idempotency/state conflicts, 500 safe internal errors, and 503 transient contention. Structured logs include request IDs, allowlisted attempt/operation/status context, and exception diagnostics while omitting request bodies, emails, coupon values, and credentials.
+Errors use `{error: {code, message, retryable, details?}}`: 400 invalid input with field details, JSON 404 for malformed or unknown API paths, 409 stock/idempotency/state conflicts, 500 safe internal or output-contract errors, and 503 transient contention. Structured logs include request IDs, allowlisted attempt/operation/status context, and exception diagnostics while omitting request bodies, emails, coupon values, and credentials.
 
-Implemented: customer/cart/product reads, inventory reservation, checkout snapshots, independent fake payment, leased recovery, coupon reservation and generation, customer counts, reporting, health checks, stable seed data, and deterministic demos. PostgreSQL tests cover immutable add replay, retries, last-unit and coupon competition, customer-first finalization locking, rollback, provider uncertainty, zero-total recovery, worker database outages, expiry, money, rewards, and reporting.
+Implemented: class-based API and service boundaries, strict input and output contracts, customer/cart/product reads, inventory reservation, checkout snapshots, independent fake payment, leased recovery, coupon reservation and generation, customer counts, reporting, health checks, stable seed data, and deterministic demos. Tests cover serializer delegation, architecture boundaries, API compatibility, immutable add replay, retries, last-unit and coupon competition, customer-first finalization locking, rollback, provider uncertainty, zero-total recovery, worker database outages, expiry, money, rewards, and reporting.
 
 Deferred: authentication, product administration, real payments, refunds, cancellation after initiation, multiple payment attempts, taxes/shipping, multiple currencies or warehouses, coupon stacking/expiry, archival, metrics dashboards, and load-tested tuning.
 
@@ -110,6 +120,6 @@ Deferred: authentication, product administration, real payments, refunds, cancel
 
 AI helped enumerate failure modes and draft transaction boundaries. I rejected an earlier AI proposal for bounded inventory pools and refill coordination because unit rows meet this assignment with less operational state. I also corrected generated reporting tests to use `TransactionTestCase`; Django `TestCase` had already opened an outer transaction and could not establish Repeatable Read at the required boundary. All accepted code was exercised in PostgreSQL.
 
-Approximate time spent: six hours across foundation, implementation, recovery demonstrations, tests, review fixes, and documentation.
+Approximate time spent: eight hours total—six hours across the initial foundation, implementation, recovery demonstrations, review fixes, and documentation, plus two hours for the requested DRF and class-based service refactor.
 
 With two more hours, I would add coordinated report/finalization and overlapping multi-product rollback tests, then run multi-process load tests around allocation, worker claiming, and lease expiry. I would use those measurements to add pending-age, retry, and lock-wait metrics and tune polling and indexes.

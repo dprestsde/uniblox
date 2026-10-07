@@ -7,8 +7,8 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from config.errors import DomainError
 from fake_payments.models import FakePayment
+from store.exceptions import ServiceError
 from store.models import (
     Cart,
     CartItem,
@@ -20,8 +20,29 @@ from store.models import (
     Product,
     RewardProgram,
 )
-from store.services.commerce import add_cart_item, checkout
-from store.services.worker import run_cycle
+from store.services.cart import CartService
+from store.services.order import OrderService
+from store.services.payment import PaymentService
+
+
+def add_cart_item(customer_id, product_id, quantity, key):
+    return CartService().add_item(
+        customer_id=customer_id,
+        product_id=product_id,
+        quantity=quantity,
+        idempotency_key=key,
+    )
+
+
+def checkout(cart_id, coupon_code, key):
+    order_data, replayed = OrderService().checkout(
+        cart_id=cart_id, coupon_code=coupon_code, idempotency_key=key
+    )
+    return Order.objects.get(id=order_data["id"]), replayed
+
+
+def run_cycle(*, attempt_id=None, provider=None, now=None):
+    return PaymentService(provider=provider).run_cycle(attempt_id=attempt_id, now=now)
 
 
 class CommerceTestCase(TransactionTestCase):
@@ -72,6 +93,32 @@ class CommerceTestCase(TransactionTestCase):
             format="json",
         )
         self.assertEqual(read_only.status_code, 400)
+
+    def test_read_and_cart_creation_endpoints_preserve_contracts(self):
+        customer = self.client.get(f"/api/v1/customers/{self.customer.id}")
+        self.assertEqual(customer.status_code, 200)
+        self.assertEqual(customer.data["orders_count"], 0)
+
+        products = self.client.get("/api/v1/products")
+        product = self.client.get(f"/api/v1/products/{self.product.id}")
+        self.assertEqual(products.status_code, 200)
+        self.assertEqual(products.data["results"][0]["id"], str(self.product.id))
+        self.assertEqual(product.status_code, 200)
+        self.assertEqual(product.data["available_quantity"], 3)
+
+        active_path = f"/api/v1/customers/{self.customer.id}/cart"
+        self.assertEqual(self.client.get(active_path).status_code, 404)
+        created = self.client.put(active_path, {}, format="json")
+        existing = self.client.put(active_path, {}, format="json")
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(existing.status_code, 200)
+        self.assertEqual(existing.data["id"], created.data["id"])
+        self.assertEqual(self.client.get(active_path).status_code, 200)
+        self.assertEqual(self.client.get(f"/api/v1/carts/{created.data['id']}").status_code, 200)
+
+        coupons = self.client.get("/api/v1/admin/coupons")
+        self.assertEqual(coupons.status_code, 200)
+        self.assertEqual(coupons.data["results"], [])
 
     def test_add_is_idempotent_and_rejects_invalid_or_excess_quantity(self):
         first = self.add(2)
@@ -205,7 +252,7 @@ class CommerceTestCase(TransactionTestCase):
         attempt.next_retry_at = timezone.now()
         attempt.local_fault = "fail-after-writes"
         attempt.save(update_fields=["next_retry_at", "local_fault"])
-        with self.assertLogs("store.services.worker", level="ERROR") as captured:
+        with self.assertLogs("store.services.payment", level="ERROR") as captured:
             self.assertEqual(run_cycle(attempt_id=attempt.id), ["retry"])
         self.assertEqual(captured.records[0].attempt_id, str(attempt.id))
         self.assertIsNotNone(captured.records[0].exc_info)
@@ -230,11 +277,14 @@ class CommerceTestCase(TransactionTestCase):
         )
         self.add(1)
         cart = self.customer.carts.get(status=Cart.Status.OPEN)
-        with patch(
-            "store.services.commerce.finalize_order", side_effect=RuntimeError("local fault")
-        ):
+        order_service = OrderService()
+        with patch.object(order_service, "finalize", side_effect=RuntimeError("local fault")):
             with self.assertRaises(RuntimeError):
-                checkout(cart.id, coupon.code, "zero-total-checkout")
+                order_service.checkout(
+                    cart_id=cart.id,
+                    coupon_code=coupon.code,
+                    idempotency_key="zero-total-checkout",
+                )
 
         order = Order.objects.get(cart=cart)
         attempt = order.payment_attempt
@@ -352,7 +402,7 @@ class CommerceConcurrencyTest(TransactionTestCase):
             try:
                 order, _ = checkout(cart.id, None, key)
                 results.append(("order", order.id))
-            except DomainError as exc:
+            except ServiceError as exc:
                 results.append((exc.code, None))
             finally:
                 close_old_connections()
@@ -421,7 +471,7 @@ class CommerceConcurrencyTest(TransactionTestCase):
             try:
                 order, _ = checkout(cart.id, coupon.code, key)
                 results.append(("order", order.id, cart.id))
-            except DomainError as exc:
+            except ServiceError as exc:
                 results.append((exc.code, None, cart.id))
             finally:
                 close_old_connections()
@@ -472,7 +522,7 @@ class CommerceConcurrencyTest(TransactionTestCase):
                     allow_checkout.wait(timeout=5)
                     try:
                         checkout(second_cart.id, coupon.code, "second-lock-order")
-                    except DomainError as exc:
+                    except ServiceError as exc:
                         results.append(exc.code)
             finally:
                 close_old_connections()
@@ -482,9 +532,7 @@ class CommerceConcurrencyTest(TransactionTestCase):
             try:
                 customer_locked.wait(timeout=5)
                 finalizer_started.set()
-                from store.services.commerce import finalize_order
-
-                finalize_order(first_order.id, succeeded=True)
+                OrderService().finalize(first_order.id, succeeded=True)
                 results.append("finalized")
             finally:
                 close_old_connections()

@@ -2,6 +2,12 @@
 
 A Django/PostgreSQL backend for reliable carts, inventory reservation, asynchronous fake payments, coupons, rewards, and reporting. Checkout commits durable intent first; a leased worker then resolves payment and atomically confirms or fails the order.
 
+## Architecture
+
+HTTP traffic follows `urls.py → APIView → command serializer → class-based service → ORM`. Plain DRF serializers validate request bodies, path and query values, and idempotency headers before invoking services. Services own database reads, writes, transactions, locking, and state-dependent validation. Separate response serializers verify every service DTO before it is returned; an invalid internal DTO is logged and becomes a safe 500 response.
+
+Workers and management commands construct the same service classes instead of accessing models directly. The fake-payment adapter is the deliberate exception: it exclusively owns provider records in the isolated `payments` database.
+
 ## Run locally
 
 Requirements: Docker Desktop with Compose and `make`.
@@ -63,6 +69,12 @@ Errors use a stable envelope. Validation is 400, missing resources 404, state or
 {"error":{"code":"insufficient_inventory","message":"Reduce the quantity to the available quantity.","retryable":false,"details":{"product_id":"…","requested":3,"available":1}}}
 ```
 
+Serializer failures identify invalid fields without exposing internals:
+
+```json
+{"error":{"code":"validation_error","message":"Invalid request.","retryable":false,"details":{"quantity":["Ensure this value is greater than or equal to 1."]}}}
+```
+
 An add-item replay with the same key and input returns HTTP 200 and the exact cart snapshot produced by the original HTTP 201, even after later edits, deletion, checkout, or cart rollover. Checkout replay intentionally returns the original order's current state. Reusing a key with different input returns 409. Failed transactions do not consume keys. Legacy add records without a recoverable snapshot return a structured 409 instead of a server error.
 
 ## Payments and recovery
@@ -81,7 +93,7 @@ docker compose run --rm worker python manage.py run_worker --once --attempt-id U
 
 Application data uses `default`; fake-provider data uses `payments`. Cross-database foreign keys are prohibited. Inventory is represented by individual rows and allocated in a short transaction using `SKIP LOCKED` plus bounded waiting. Reports use one read-only repeatable-read snapshot.
 
-This is a submission-ready, focused six-hour assignment implementation; it is not described as production-deployed. Deferred scope includes authentication, product administration, real payment integration, refunds, multiple payment attempts, multiple warehouses/currencies, coupon stacking/expiry, and measured throughput tuning. Longer multi-product contention, report/finalization overlap, and load tests are also deferred. See [DECISIONS.md](DECISIONS.md) and [EDGE_CASES.md](EDGE_CASES.md).
+This is a submission-ready assignment implementation, not a production deployment. Work took approximately eight hours: six hours for the initial implementation and review fixes, followed by two hours of requested API and service-boundary hardening. Deferred scope includes authentication, product administration, real payment integration, refunds, multiple payment attempts, multiple warehouses/currencies, coupon stacking/expiry, and measured throughput tuning. Longer multi-product contention, report/finalization overlap, and load tests are also deferred. See [DECISIONS.md](DECISIONS.md) and [EDGE_CASES.md](EDGE_CASES.md).
 
 Unknown `/api/v1` paths, malformed path UUIDs, validation failures, and unexpected API exceptions all use the documented JSON error envelope. Server logs retain safe diagnostic exception data plus allowlisted request, attempt, operation, and status fields; request bodies, emails, coupon codes, and credentials are not logged by default.
 

@@ -6,17 +6,20 @@ import threading
 from django.core.management.base import BaseCommand
 from django.db import connections
 
+from store.services.worker import run_cycle
+
 logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    help = "Run the recovery worker (foundation skeleton; no handlers registered)."
+    help = "Process payment attempts and recover pending orders."
 
     def add_arguments(self, parser):
         parser.add_argument("--once", action="store_true")
         parser.add_argument(
             "--poll-seconds", type=float, default=float(os.getenv("WORKER_POLL_SECONDS", "5"))
         )
+        parser.add_argument("--attempt-id")
 
     def handle(self, *args, **options):
         if options["poll_seconds"] <= 0:
@@ -33,8 +36,8 @@ class Command(BaseCommand):
         logger.info("worker_started")
         try:
             while not stopping.is_set():
-                logger.info("worker_idle_no_handlers_registered")
-                self.stdout.write("No handlers registered; processed 0 jobs.")
+                outcomes = run_cycle(attempt_id=options["attempt_id"])
+                self.stdout.write(f"Processed {len(outcomes)} payment attempt(s): {outcomes}")
                 connections.close_all()
                 if options["once"]:
                     break

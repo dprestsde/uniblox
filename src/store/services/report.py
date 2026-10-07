@@ -2,7 +2,7 @@ from django.db import connection, transaction
 from django.db.models import Count, Sum
 from django.db.models.functions import Coalesce
 
-from store.models import Coupon, Order
+from store.models import Coupon, Order, OrderItem, Product
 
 
 class ReportService:
@@ -17,10 +17,16 @@ class ReportService:
                 discounts_cents=Coalesce(Sum("discount_cents"), 0),
                 net_revenue_cents=Coalesce(Sum("net_cents"), 0),
             )
-            purchased = (
-                confirmed.values("items__product_id", "items__product_name")
-                .annotate(quantity=Sum("items__quantity"))
-                .order_by("items__product_id")
+            purchased = list(
+                OrderItem.objects.filter(order__status=Order.Status.CONFIRMED)
+                .values("product_id")
+                .annotate(quantity=Sum("quantity"))
+                .order_by("product_id")
+            )
+            product_names = dict(
+                Product.objects.filter(id__in=[row["product_id"] for row in purchased]).values_list(
+                    "id", "name"
+                )
             )
             coupon_counts = {
                 status.lower(): count
@@ -38,8 +44,8 @@ class ReportService:
                 **totals,
                 "purchased_quantities": [
                     {
-                        "product_id": str(row["items__product_id"]),
-                        "name": row["items__product_name"],
+                        "product_id": str(row["product_id"]),
+                        "name": product_names[row["product_id"]],
                         "quantity": row["quantity"],
                     }
                     for row in purchased

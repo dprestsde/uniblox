@@ -352,6 +352,32 @@ class CommerceTestCase(TransactionTestCase):
             report.data["net_revenue_cents"],
         )
 
+    def test_report_aggregates_renamed_product_by_id_with_current_name(self):
+        self.add(1, "first-report-add")
+        first = self.checkout("first-report-checkout")
+        first_order = Order.objects.get(id=first.data["id"])
+        run_cycle(attempt_id=first_order.payment_attempt.id)
+
+        self.product.name = "Keyboard Pro"
+        self.product.save(update_fields=["name"])
+        self.add(1, "second-report-add")
+        second = self.checkout("second-report-checkout")
+        second_order = Order.objects.get(id=second.data["id"])
+        run_cycle(attempt_id=second_order.payment_attempt.id)
+
+        report = self.client.get("/api/v1/admin/reports/summary")
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(
+            report.data["purchased_quantities"],
+            [
+                {
+                    "product_id": str(self.product.id),
+                    "name": "Keyboard Pro",
+                    "quantity": 2,
+                }
+            ],
+        )
+
     def test_new_purchase_gets_a_new_open_cart(self):
         self.add(1)
         first_cart = self.customer.carts.get(status="OPEN")

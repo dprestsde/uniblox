@@ -19,6 +19,7 @@ from store.api.serializers import (
     CustomerCreateSerializer,
     CustomerPathSerializer,
     CustomerSerializer,
+    IdempotencyHeaderSerializer,
     OrderPathSerializer,
     OrderSerializer,
     PaginationSerializer,
@@ -58,10 +59,10 @@ class ServiceAPIView(APIView):
     def get_service(self):
         return self.service_class()
 
-    def command(self, serializer_class, data):
+    def command(self, serializer_class, data, **trusted_values):
         serializer = serializer_class(data=data, context={"service": self.get_service()})
         serializer.is_valid(raise_exception=True)
-        return serializer.save()
+        return serializer.save(**trusted_values)
 
     @staticmethod
     def validated(serializer_class, data):
@@ -112,9 +113,8 @@ class ActiveCartView(ServiceAPIView):
         return validated_response(CartSerializer, self.get_service().get_active(**values))
 
     def put(self, request, customer_id):
-        cart, created = self.command(
-            ActiveCartCreateSerializer, {**request.data, "customer_id": customer_id}
-        )
+        path = self.validated(CustomerPathSerializer, {"customer_id": customer_id})
+        cart, created = self.command(ActiveCartCreateSerializer, request.data, **path)
         return validated_response(
             CartSerializer,
             cart,
@@ -126,13 +126,16 @@ class CartItemCreateView(ServiceAPIView):
     service_class = CartService
 
     def post(self, request, customer_id):
+        path = self.validated(CustomerPathSerializer, {"customer_id": customer_id})
+        header = self.validated(
+            IdempotencyHeaderSerializer,
+            {"idempotency_key": request.headers.get("Idempotency-Key")},
+        )
         cart, replayed = self.command(
             CartItemAddSerializer,
-            {
-                **request.data,
-                "customer_id": customer_id,
-                "idempotency_key": request.headers.get("Idempotency-Key"),
-            },
+            request.data,
+            **path,
+            **header,
         )
         return validated_response(
             CartSerializer,
@@ -153,16 +156,24 @@ class CartItemDetailView(ServiceAPIView):
     service_class = CartService
 
     def patch(self, request, cart_id, product_id):
+        cart_path = self.validated(CartPathSerializer, {"cart_id": cart_id})
+        product_path = self.validated(ProductPathSerializer, {"product_id": product_id})
         cart = self.command(
             CartItemUpdateSerializer,
-            {**request.data, "cart_id": cart_id, "product_id": product_id},
+            request.data,
+            **cart_path,
+            **product_path,
         )
         return validated_response(CartSerializer, cart)
 
     def delete(self, request, cart_id, product_id):
+        cart_path = self.validated(CartPathSerializer, {"cart_id": cart_id})
+        product_path = self.validated(ProductPathSerializer, {"product_id": product_id})
         self.command(
             CartItemRemoveSerializer,
-            {**request.data, "cart_id": cart_id, "product_id": product_id},
+            request.data,
+            **cart_path,
+            **product_path,
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -171,13 +182,16 @@ class CheckoutView(ServiceAPIView):
     service_class = OrderService
 
     def post(self, request, cart_id):
+        path = self.validated(CartPathSerializer, {"cart_id": cart_id})
+        header = self.validated(
+            IdempotencyHeaderSerializer,
+            {"idempotency_key": request.headers.get("Idempotency-Key")},
+        )
         order, _ = self.command(
             CheckoutSerializer,
-            {
-                **request.data,
-                "cart_id": cart_id,
-                "idempotency_key": request.headers.get("Idempotency-Key"),
-            },
+            request.data,
+            **path,
+            **header,
         )
         response_status = (
             status.HTTP_202_ACCEPTED if order["status"] == "PENDING" else status.HTTP_200_OK
@@ -197,9 +211,14 @@ class CouponGenerationView(ServiceAPIView):
     service_class = CouponService
 
     def post(self, request):
+        header = self.validated(
+            IdempotencyHeaderSerializer,
+            {"idempotency_key": request.headers.get("Idempotency-Key")},
+        )
         coupon, replayed = self.command(
             CouponGenerateSerializer,
-            {**request.data, "idempotency_key": request.headers.get("Idempotency-Key")},
+            request.data,
+            **header,
         )
         return validated_response(
             CouponSerializer,

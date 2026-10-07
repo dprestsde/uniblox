@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 from rest_framework import serializers
 
 from store.exceptions import ServiceError
@@ -5,6 +7,8 @@ from store.exceptions import ServiceError
 
 class StrictSerializer(serializers.Serializer):
     def to_internal_value(self, data):
+        if not isinstance(data, Mapping):
+            return super().to_internal_value(data)
         unknown = set(data) - set(self.fields)
         if unknown:
             raise serializers.ValidationError(
@@ -13,7 +17,7 @@ class StrictSerializer(serializers.Serializer):
         return super().to_internal_value(data)
 
 
-class IdempotencyCommandSerializer(StrictSerializer):
+class IdempotencyHeaderSerializer(StrictSerializer):
     idempotency_key = serializers.CharField(
         max_length=200,
         trim_whitespace=True,
@@ -89,13 +93,12 @@ class ProductPathSerializer(StrictSerializer):
     product_id = serializers.UUIDField()
 
 
-class ActiveCartCreateSerializer(CustomerPathSerializer):
+class ActiveCartCreateSerializer(StrictSerializer):
     def create(self, validated_data):
-        return self.context["service"].create_active(validated_data["customer_id"])
+        return self.context["service"].create_active(validated_data.pop("customer_id"))
 
 
-class CartItemAddSerializer(IdempotencyCommandSerializer):
-    customer_id = serializers.UUIDField()
+class CartItemAddSerializer(StrictSerializer):
     product_id = serializers.UUIDField()
     quantity = serializers.IntegerField(min_value=1)
 
@@ -104,8 +107,6 @@ class CartItemAddSerializer(IdempotencyCommandSerializer):
 
 
 class CartItemUpdateSerializer(StrictSerializer):
-    cart_id = serializers.UUIDField()
-    product_id = serializers.UUIDField()
     quantity = serializers.IntegerField(min_value=1)
 
     def create(self, validated_data):
@@ -113,16 +114,12 @@ class CartItemUpdateSerializer(StrictSerializer):
 
 
 class CartItemRemoveSerializer(StrictSerializer):
-    cart_id = serializers.UUIDField()
-    product_id = serializers.UUIDField()
-
     def create(self, validated_data):
         self.context["service"].remove_item(**validated_data)
         return {"removed": True}
 
 
-class CheckoutSerializer(IdempotencyCommandSerializer):
-    cart_id = serializers.UUIDField()
+class CheckoutSerializer(StrictSerializer):
     coupon_code = serializers.CharField(
         max_length=64, trim_whitespace=True, required=False, allow_blank=True, allow_null=True
     )
@@ -174,19 +171,14 @@ class CouponSerializer(StrictSerializer):
     owner_order_id = serializers.UUIDField(allow_null=True)
 
 
-class CouponGenerateSerializer(IdempotencyCommandSerializer):
+class CouponGenerateSerializer(StrictSerializer):
     def create(self, validated_data):
         return self.context["service"].generate(**validated_data)
 
 
 class PaginationSerializer(StrictSerializer):
-    page = serializers.IntegerField(default=1)
-    page_size = serializers.IntegerField(default=20)
-
-    def validate(self, attrs):
-        attrs["page"] = max(attrs["page"], 1)
-        attrs["page_size"] = min(max(attrs["page_size"], 1), 100)
-        return attrs
+    page = serializers.IntegerField(default=1, min_value=1)
+    page_size = serializers.IntegerField(default=20, min_value=1, max_value=100)
 
 
 class ProductPageSerializer(StrictSerializer):

@@ -12,6 +12,7 @@ from store.api.serializers import (
     CartItemAddSerializer,
     CheckoutSerializer,
     CustomerCreateSerializer,
+    IdempotencyHeaderSerializer,
     PaginationSerializer,
 )
 from store.exceptions import ServiceError
@@ -37,9 +38,7 @@ class SerializerTests(SimpleTestCase):
 
     def test_cart_input_rejects_invalid_quantities_and_delegates(self):
         base = {
-            "customer_id": str(uuid.uuid4()),
             "product_id": str(uuid.uuid4()),
-            "idempotency_key": "add-1",
         }
         for quantity in (True, 0, -1, 1.5):
             serializer = CartItemAddSerializer(data={**base, "quantity": quantity})
@@ -52,34 +51,45 @@ class SerializerTests(SimpleTestCase):
             data={**base, "quantity": 2}, context={"service": service}
         )
         self.assertTrue(serializer.is_valid())
-        self.assertEqual(serializer.save(), ({"id": "snapshot"}, False))
-        service.add_item.assert_called_once()
+        customer_id = uuid.uuid4()
+        self.assertEqual(
+            serializer.save(customer_id=customer_id, idempotency_key="add-1"),
+            ({"id": "snapshot"}, False),
+        )
+        service.add_item.assert_called_once_with(
+            customer_id=customer_id,
+            product_id=serializer.validated_data["product_id"],
+            quantity=2,
+            idempotency_key="add-1",
+        )
 
     def test_checkout_normalizes_coupon_and_requires_idempotency_key(self):
         serializer = CheckoutSerializer(
-            data={
-                "cart_id": str(uuid.uuid4()),
-                "coupon_code": " SAVE10 ",
-                "idempotency_key": "checkout-1",
-            },
-            context={"service": Mock()},
+            data={"coupon_code": " SAVE10 "}, context={"service": Mock()}
         )
         self.assertTrue(serializer.is_valid())
         self.assertEqual(serializer.validated_data["coupon_code"], "SAVE10")
 
-        missing = CheckoutSerializer(data={"cart_id": str(uuid.uuid4()), "idempotency_key": None})
+        missing = IdempotencyHeaderSerializer(data={"idempotency_key": None})
         with self.assertRaises(ServiceError) as raised:
             missing.is_valid(raise_exception=True)
         self.assertEqual(raised.exception.code, "idempotency_key_required")
 
-    def test_pagination_preserves_clamping_and_rejects_nonintegers(self):
-        serializer = PaginationSerializer(data={"page": -2, "page_size": 500})
-        self.assertTrue(serializer.is_valid())
-        self.assertEqual(serializer.validated_data, {"page": 1, "page_size": 100})
+    def test_pagination_accepts_boundaries_and_rejects_out_of_range_values(self):
+        for data in ({"page": 1, "page_size": 1}, {"page": 1, "page_size": 100}):
+            serializer = PaginationSerializer(data=data)
+            self.assertTrue(serializer.is_valid(), serializer.errors)
 
-        invalid = PaginationSerializer(data={"page": "many"})
-        self.assertFalse(invalid.is_valid())
-        self.assertIn("page", invalid.errors)
+        for data, field in (
+            ({"page": 0}, "page"),
+            ({"page": -1}, "page"),
+            ({"page_size": 0}, "page_size"),
+            ({"page_size": 101}, "page_size"),
+            ({"page": "many"}, "page"),
+        ):
+            serializer = PaginationSerializer(data=data)
+            self.assertFalse(serializer.is_valid(), data)
+            self.assertIn(field, serializer.errors)
 
 
 class ApiArchitectureTests(SimpleTestCase):
@@ -127,6 +137,65 @@ class ApiArchitectureTests(SimpleTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data["error"]["code"], "validation_error")
         self.assertIn("quantity", response.data["error"]["details"])
+
+    def test_non_object_json_bodies_return_validation_errors(self):
+        for payload in ("[{}]", "42", '"text"', "null"):
+            response = self.client.generic(
+                "POST", "/api/v1/customers", payload, content_type="application/json"
+            )
+            self.assertEqual(response.status_code, 400, payload)
+            self.assertEqual(response.data["error"]["code"], "validation_error")
+
+        customer_id = uuid.uuid4()
+        cart_id = uuid.uuid4()
+        endpoints = (
+            (f"/api/v1/customers/{customer_id}/cart/items", {"Idempotency-Key": "body-1"}),
+            (f"/api/v1/carts/{cart_id}/checkout", {"Idempotency-Key": "body-2"}),
+            ("/api/v1/admin/coupons/generate", {"Idempotency-Key": "body-3"}),
+        )
+        for path, headers in endpoints:
+            response = self.client.generic(
+                "POST", path, "[{}]", content_type="application/json", headers=headers
+            )
+            self.assertEqual(response.status_code, 400, path)
+            self.assertEqual(response.data["error"]["code"], "validation_error")
+
+    def test_body_cannot_override_path_or_idempotency_header(self):
+        customer_id = uuid.uuid4()
+        response = self.client.post(
+            f"/api/v1/customers/{customer_id}/cart/items",
+            {
+                "customer_id": str(uuid.uuid4()),
+                "idempotency_key": "body-key",
+                "product_id": str(uuid.uuid4()),
+                "quantity": 1,
+            },
+            format="json",
+            headers={"Idempotency-Key": "header-key"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertCountEqual(response.data["error"]["details"], ["customer_id", "idempotency_key"])
+
+        cart_id = uuid.uuid4()
+        checkout = self.client.post(
+            f"/api/v1/carts/{cart_id}/checkout",
+            {"cart_id": str(uuid.uuid4())},
+            format="json",
+            headers={"Idempotency-Key": "checkout-key"},
+        )
+        self.assertEqual(checkout.status_code, 400)
+        self.assertIn("cart_id", checkout.data["error"]["details"])
+
+    def test_invalid_pagination_returns_field_errors(self):
+        for query, field in (
+            ("page=0", "page"),
+            ("page=-1", "page"),
+            ("page_size=0", "page_size"),
+            ("page_size=101", "page_size"),
+        ):
+            response = self.client.get(f"/api/v1/products?{query}")
+            self.assertEqual(response.status_code, 400, query)
+            self.assertIn(field, response.data["error"]["details"])
 
     @patch("store.api.views.ProductService.list")
     def test_invalid_service_output_returns_safe_internal_error(self, list_products):

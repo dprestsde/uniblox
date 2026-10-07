@@ -31,7 +31,7 @@ Checkout freezes the cart as `CHECKOUT_STARTED`. A customer can then immediately
 
 ## Checkout, idempotency, and money
 
-Keyed operations store `(operation, scope, key)`, a SHA-256 fingerprint of canonical JSON input, and a committed resource reference. Records are written in the mutation transaction and retained indefinitely for this assignment. The service checks a committed record before revalidating current stock or coupon state. Same input replays; changed input conflicts. Database uniqueness on `Order.cart` rejects a second checkout even with another key.
+Keyed operations store `(operation, scope, key)`, a SHA-256 fingerprint of canonical JSON input, a committed resource reference, and an optional immutable JSON result. Records are written in the mutation transaction and retained indefinitely for this assignment. The service checks a committed record before revalidating current stock or coupon state. Add-item retries return the exact original cart snapshot even if the line is later changed or deleted or the customer has moved to a new cart. Checkout keeps a dynamic reference because callers need the order's current state. Same input replays; changed input conflicts. Database uniqueness on `Order.cart` rejects a second checkout even with another key.
 
 The pending-order transaction persists order/items, reservation, unit ownership, coupon ownership, payment attempt, cart freeze, and replay record together. Any validation, constraint, or allocation failure rolls back all of them.
 
@@ -43,7 +43,7 @@ discount = (gross × whole_percentage + 50) // 100
 net = gross − discount
 ```
 
-This is half-up rounding once on subtotal. A supported upper bound is checked before payment creation. A zero net amount creates a successful local attempt and follows the same finalizer without calling the provider.
+This is half-up rounding once on subtotal. A supported upper bound is checked before payment creation. A zero net amount creates a successful, initiated payment attempt in the pending-order transaction. Request-side finalization may fail independently; the due worker then uses the stored outcome and never calls the provider.
 
 ## Payment persistence and recovery
 
@@ -51,9 +51,9 @@ One `PaymentAttempt` exists per order. Its provider key is unique, and the fake 
 
 The worker claims at most ten due attempts per cycle. A claim uses `SELECT FOR UPDATE SKIP LOCKED`, increments attempts, assigns a unique token and 30-second deadline, then commits. The owner records initiation before the first provider call. For initiated recovery it queries status first and only submits when status definitively says the provider key is absent.
 
-A known provider outcome is saved before local finalization. Success marks units sold, reservation confirmed, coupon redeemed, order confirmed, and atomically increments the customer count. Failure releases units and coupon, releases the reservation, and fails the order. A repeated matching transition is harmless; a conflicting terminal transition fails.
+A known provider outcome is saved before local finalization. Finalization first reads the immutable customer ID, then locks Customer before Order, PaymentAttempt, Reservation, Coupon, and InventoryUnit. Success marks units sold, reservation confirmed, coupon redeemed, order confirmed, and atomically increments the customer count. Failure releases units and coupon, releases the reservation, and fails the order. A repeated matching transition is harmless; a conflicting terminal transition fails.
 
-Every scheduling and attempt-state write filters by the lease token. An expired owner can therefore finish provider I/O but cannot overwrite a newer owner’s scheduling state. Provider idempotency and locked finalization remain correctness safeguards if work overlaps. Backoff doubles with deterministic jitter and caps at 60 seconds. Five attempts and orders pending over 15 minutes are flagged, but recovery continues.
+Every scheduling and attempt-state write filters by the lease token. An expired owner can therefore finish provider I/O but cannot overwrite a newer owner’s scheduling state. Provider idempotency and locked finalization remain correctness safeguards if work overlaps. Backoff doubles with deterministic jitter and caps at 60 seconds. Five attempts and orders pending over 15 minutes are flagged, but recovery continues. If retry-state persistence itself fails, that database error is logged separately and propagated to the worker loop. Continuous mode closes stale connections, waits, and resumes; one-pass mode exits nonzero for operator and CI visibility. Compose adds process restart as a second recovery layer.
 
 Reservations initially expire after five minutes. If initiation has not occurred, worker expiry and initiation lock the same attempt/reservation path; expiry fails locally without contacting the provider. After initiation, expiry cannot release resources because payment may have succeeded. Unknown results retain both inventory and coupon holds.
 
@@ -76,6 +76,6 @@ The report opens a short read-only Repeatable Read transaction before issuing ag
 
 `make demo` pauses the regular worker, creates isolated records, and exercises success, definitive payment failure, pre-initiation expiry, provider response loss, rollback after successful-payment finalization writes, and rollback after failed-payment release writes. Fault flags are consumed outside the deliberately rolled-back transaction, so recovery can succeed on the next pass.
 
-PostgreSQL tests use real database aliases. Threaded `TransactionTestCase` tests coordinate simultaneous first additions and last-unit checkout. Other tests verify replay fingerprints, frozen snapshots, coupon release, independent provider persistence, local rollback, recovery, expiry, reward replay, money rounding, and reporting. The implemented mechanisms also address multi-product rollback, worker fencing, and coupon/milestone uniqueness; longer overlapping stress tests for those paths remain the first validation extension.
+PostgreSQL tests use real database aliases. Threaded `TransactionTestCase` tests coordinate simultaneous first additions, last-unit checkout, two-customer coupon competition, and same-customer finalization against coupon reuse. Other tests verify immutable add response snapshots, replay fingerprints, frozen snapshots, coupon ownership across rollback, independent provider persistence, local rollback, zero-total recovery without provider calls, worker database-outage recovery, JSON errors, safe diagnostic logs, expiry, reward replay, money rounding, and reporting. Longer overlapping multi-product, report/finalization, and load tests remain deferred; no throughput claim is made.
 
 Capacity is not claimed. Likely limits are connection counts, due-work polling, provider latency and rate limits, unresolved holds, and unit-row volume. Production evolution would add metrics for pending age, retries, lease takeovers, and lock waits; tune batches and indexes; and introduce a broker or partitioning only when measurements justify it.

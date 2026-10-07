@@ -1,7 +1,8 @@
 from datetime import timedelta
-from threading import Barrier, Thread
+from threading import Barrier, Event, Thread
+from unittest.mock import Mock, patch
 
-from django.db import close_old_connections
+from django.db import DatabaseError, close_old_connections, transaction
 from django.test import TransactionTestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -86,6 +87,50 @@ class CommerceTestCase(TransactionTestCase):
         invalid = self.add(True, "add-3")
         self.assertEqual(invalid.status_code, 400)
 
+    def test_legacy_add_replay_without_snapshot_returns_conflict(self):
+        self.assertEqual(self.add(1, "legacy-add").status_code, 201)
+        from store.models import IdempotencyRecord
+
+        IdempotencyRecord.objects.filter(operation="cart.add", key="legacy-add").update(
+            response_snapshot={}
+        )
+        replay = self.add(1, "legacy-add")
+        self.assertEqual(replay.status_code, 409)
+        self.assertEqual(replay.data["error"]["code"], "idempotency_result_unavailable")
+        self.assertEqual(CartItem.objects.get().quantity, 1)
+
+    def test_add_replay_returns_immutable_snapshot_after_cart_changes(self):
+        first = self.add(1, "immutable-add")
+        original = first.json()
+        cart_id = original["id"]
+
+        self.assertEqual(self.add(1, "second-add").status_code, 201)
+        replay = self.add(1, "immutable-add")
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.json(), original)
+        self.assertEqual(CartItem.objects.get(cart_id=cart_id).quantity, 2)
+
+        updated = self.client.patch(
+            f"/api/v1/carts/{cart_id}/items/{self.product.id}",
+            {"quantity": 3},
+            format="json",
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(self.add(1, "immutable-add").json(), original)
+
+        removed = self.client.delete(f"/api/v1/carts/{cart_id}/items/{self.product.id}")
+        self.assertEqual(removed.status_code, 204)
+        self.assertEqual(self.add(1, "immutable-add").json(), original)
+        self.assertFalse(CartItem.objects.filter(cart_id=cart_id).exists())
+
+        self.assertEqual(self.add(1, "replacement-add").status_code, 201)
+        self.assertEqual(self.checkout("rollover-checkout").status_code, 202)
+        new_cart = self.add(1, "new-cart-add")
+        self.assertNotEqual(new_cart.data["id"], cart_id)
+        rollover_replay = self.add(1, "immutable-add")
+        self.assertEqual(rollover_replay.json(), original)
+        self.assertEqual(self.customer.carts.filter(status=Cart.Status.OPEN).count(), 1)
+
     def test_checkout_reserves_snapshot_and_replays_terminal_order(self):
         self.add(1)
         response = self.checkout()
@@ -135,8 +180,14 @@ class CommerceTestCase(TransactionTestCase):
         self.assertEqual(InventoryUnit.objects.filter(status="AVAILABLE").count(), 3)
 
     def test_lost_provider_response_and_failed_local_confirmation_recover(self):
+        coupon = Coupon.objects.create(
+            program=RewardProgram.objects.get(),
+            code="RECOVER10",
+            percentage=10,
+            milestone=1,
+        )
         self.add(1)
-        response = self.checkout()
+        response = self.checkout(coupon_code=coupon.code)
         order = Order.objects.get(id=response.data["id"])
         attempt = order.payment_attempt
         FakePayment.objects.using("payments").create(
@@ -154,12 +205,64 @@ class CommerceTestCase(TransactionTestCase):
         attempt.next_retry_at = timezone.now()
         attempt.local_fault = "fail-after-writes"
         attempt.save(update_fields=["next_retry_at", "local_fault"])
-        self.assertEqual(run_cycle(attempt_id=attempt.id), ["retry"])
+        with self.assertLogs("store.services.worker", level="ERROR") as captured:
+            self.assertEqual(run_cycle(attempt_id=attempt.id), ["retry"])
+        self.assertEqual(captured.records[0].attempt_id, str(attempt.id))
+        self.assertIsNotNone(captured.records[0].exc_info)
+        self.assertIn("fail-after-writes", str(captured.records[0].exc_info[1]))
         order.refresh_from_db()
+        coupon.refresh_from_db()
         self.assertEqual(order.status, Order.Status.PENDING)
         self.assertEqual(order.reservation.units.filter(status="RESERVED").count(), 1)
+        self.assertEqual(coupon.status, Coupon.Status.RESERVED)
+        self.assertEqual(coupon.owner_order_id, order.id)
         PaymentAttempt.objects.filter(id=attempt.id).update(next_retry_at=timezone.now())
         self.assertEqual(run_cycle(attempt_id=attempt.id), ["confirmed"])
+        coupon.refresh_from_db()
+        self.assertEqual(coupon.status, Coupon.Status.REDEEMED)
+
+    def test_zero_total_recovery_never_calls_provider(self):
+        coupon = Coupon.objects.create(
+            program=RewardProgram.objects.get(),
+            code="FREE100",
+            percentage=100,
+            milestone=1,
+        )
+        self.add(1)
+        cart = self.customer.carts.get(status=Cart.Status.OPEN)
+        with patch(
+            "store.services.commerce.finalize_order", side_effect=RuntimeError("local fault")
+        ):
+            with self.assertRaises(RuntimeError):
+                checkout(cart.id, coupon.code, "zero-total-checkout")
+
+        order = Order.objects.get(cart=cart)
+        attempt = order.payment_attempt
+        self.assertEqual(order.status, Order.Status.PENDING)
+        self.assertEqual(attempt.outcome, PaymentAttempt.Outcome.SUCCEEDED)
+        self.assertIsNotNone(attempt.initiated_at)
+        self.assertEqual(attempt.provider_reference, "zero-total")
+
+        provider = Mock()
+        self.assertEqual(run_cycle(attempt_id=attempt.id, provider=provider), ["confirmed"])
+        provider.pay.assert_not_called()
+        provider.get_status.assert_not_called()
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.Status.CONFIRMED)
+
+    def test_payment_attempt_database_error_propagates_after_reschedule(self):
+        self.add(1)
+        response = self.checkout()
+        order = Order.objects.get(id=response.data["id"])
+        provider = Mock()
+        provider.get_status.side_effect = DatabaseError("provider database unavailable")
+
+        with self.assertRaises(DatabaseError):
+            run_cycle(attempt_id=order.payment_attempt.id, provider=provider)
+
+        order.payment_attempt.refresh_from_db()
+        self.assertIsNone(order.payment_attempt.lease_token)
+        self.assertIn("provider database unavailable", order.payment_attempt.last_error)
 
     def test_expiry_before_initiation_does_not_call_provider(self):
         self.add(1)
@@ -280,8 +383,8 @@ class CommerceConcurrencyTest(TransactionTestCase):
         def run(product, key):
             close_old_connections()
             barrier.wait()
-            item, _ = add_cart_item(customer.id, product.id, 1, key)
-            results.append(item.cart_id)
+            snapshot, _ = add_cart_item(customer.id, product.id, 1, key)
+            results.append(snapshot["id"])
             close_old_connections()
 
         threads = [
@@ -295,3 +398,109 @@ class CommerceConcurrencyTest(TransactionTestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(len(set(results)), 1)
         self.assertEqual(customer.carts.filter(status=Cart.Status.OPEN).count(), 1)
+
+    def test_two_customers_competing_for_one_coupon_have_one_winner(self):
+        program = RewardProgram.objects.create(key="default", orders_per_coupon=1, percentage=10)
+        coupon = Coupon.objects.create(program=program, code="ONLYONE", percentage=10, milestone=1)
+        product = Product.objects.create(name="Coupon product", price_cents=100)
+        InventoryUnit.objects.bulk_create([InventoryUnit(product=product) for _ in range(2)])
+        carts = []
+        for number in range(2):
+            customer = Customer.objects.create(
+                name=f"Coupon Buyer {number}", email=f"coupon-{number}@test.example"
+            )
+            cart = customer.carts.create()
+            CartItem.objects.create(cart=cart, product=product, quantity=1)
+            carts.append(cart)
+        barrier = Barrier(2)
+        results = []
+
+        def run(cart, key):
+            close_old_connections()
+            barrier.wait()
+            try:
+                order, _ = checkout(cart.id, coupon.code, key)
+                results.append(("order", order.id, cart.id))
+            except DomainError as exc:
+                results.append((exc.code, None, cart.id))
+            finally:
+                close_old_connections()
+
+        threads = [
+            Thread(target=run, args=(cart, f"coupon-race-{index}"))
+            for index, cart in enumerate(carts)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(sum(result[0] == "order" for result in results), 1)
+        self.assertEqual(sum(result[0] == "coupon_reserved" for result in results), 1)
+        losing_cart_id = next(result[2] for result in results if result[0] == "coupon_reserved")
+        self.assertEqual(Cart.objects.get(id=losing_cart_id).status, Cart.Status.OPEN)
+        coupon.refresh_from_db()
+        self.assertEqual(coupon.status, Coupon.Status.RESERVED)
+        self.assertEqual(Order.objects.filter(status=Order.Status.PENDING).count(), 1)
+
+    def test_finalization_and_same_customer_coupon_checkout_do_not_deadlock(self):
+        program = RewardProgram.objects.create(key="default", orders_per_coupon=1, percentage=10)
+        coupon = Coupon.objects.create(program=program, code="LOCKED", percentage=10, milestone=1)
+        customer = Customer.objects.create(name="Lock Buyer", email="lock@test.example")
+        first_product = Product.objects.create(name="First", price_cents=100)
+        second_product = Product.objects.create(name="Second", price_cents=100)
+        InventoryUnit.objects.create(product=first_product)
+        InventoryUnit.objects.create(product=second_product)
+        first_cart = customer.carts.create()
+        CartItem.objects.create(cart=first_cart, product=first_product, quantity=1)
+        first_order, _ = checkout(first_cart.id, coupon.code, "first-lock-order")
+        second_cart = customer.carts.create()
+        CartItem.objects.create(cart=second_cart, product=second_product, quantity=1)
+
+        customer_locked = Event()
+        finalizer_started = Event()
+        allow_checkout = Event()
+        results = []
+
+        def competing_checkout():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    Customer.objects.select_for_update().get(id=customer.id)
+                    customer_locked.set()
+                    allow_checkout.wait(timeout=5)
+                    try:
+                        checkout(second_cart.id, coupon.code, "second-lock-order")
+                    except DomainError as exc:
+                        results.append(exc.code)
+            finally:
+                close_old_connections()
+
+        def finalize():
+            close_old_connections()
+            try:
+                customer_locked.wait(timeout=5)
+                finalizer_started.set()
+                from store.services.commerce import finalize_order
+
+                finalize_order(first_order.id, succeeded=True)
+                results.append("finalized")
+            finally:
+                close_old_connections()
+
+        checkout_thread = Thread(target=competing_checkout)
+        finalize_thread = Thread(target=finalize)
+        checkout_thread.start()
+        finalize_thread.start()
+        self.assertTrue(finalizer_started.wait(timeout=5))
+        allow_checkout.set()
+        checkout_thread.join(timeout=10)
+        finalize_thread.join(timeout=10)
+
+        self.assertFalse(checkout_thread.is_alive())
+        self.assertFalse(finalize_thread.is_alive())
+        self.assertCountEqual(results, ["coupon_reserved", "finalized"])
+        first_order.refresh_from_db()
+        self.assertEqual(first_order.status, Order.Status.CONFIRMED)
+        self.assertEqual(Cart.objects.get(id=second_cart.id).status, Cart.Status.OPEN)

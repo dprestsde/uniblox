@@ -1,12 +1,18 @@
+import json
+import logging
+import sys
 from unittest.mock import patch
 
-from django.db import connections
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.db import DatabaseError, connections
 from django.test import SimpleTestCase, TestCase
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APIClient
 
 from config.db_router import DatabaseRouter
 from config.errors import json_exception_handler
+from config.logging import JsonFormatter
 
 
 class HealthTests(SimpleTestCase):
@@ -33,6 +39,72 @@ class HealthTests(SimpleTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data["error"]["code"], "validation_error")
         self.assertFalse(response.data["error"]["retryable"])
+
+    def test_api_fallbacks_return_json_envelopes(self):
+        malformed = self.client.get("/api/v1/customers/not-a-uuid")
+        missing = self.client.get("/api/v1/not-a-real-route")
+        for response in (malformed, missing):
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response["Content-Type"], "application/json")
+            self.assertEqual(response.json()["error"]["code"], "not_found")
+
+    def test_unexpected_exception_is_logged_and_hidden(self):
+        with self.assertLogs("config.errors", level="ERROR"):
+            response = json_exception_handler(RuntimeError("private diagnostic"), {})
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.data["error"]["code"], "internal_error")
+        self.assertNotIn("private diagnostic", str(response.data))
+
+    def test_json_logs_include_safe_context_and_exception(self):
+        try:
+            raise ValueError("diagnostic detail")
+        except ValueError:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord(
+            "store.services.worker",
+            logging.ERROR,
+            __file__,
+            1,
+            "payment_attempt_processing_failed",
+            (),
+            exc_info,
+        )
+        record.attempt_id = "attempt-123"
+        record.operation = "finalize"
+        payload = json.loads(JsonFormatter().format(record))
+        self.assertEqual(payload["attempt_id"], "attempt-123")
+        self.assertEqual(payload["operation"], "finalize")
+        self.assertIn("ValueError: diagnostic detail", payload["exception"])
+
+
+class WorkerCommandTests(SimpleTestCase):
+    class TwoCycleEvent:
+        def __init__(self):
+            self.checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            return self.checks > 2
+
+        def set(self):
+            self.checks = 3
+
+        def wait(self, timeout):
+            return False
+
+    @patch("store.management.commands.run_worker.signal.signal")
+    @patch("store.management.commands.run_worker.threading.Event", new=TwoCycleEvent)
+    @patch("store.management.commands.run_worker.run_cycle")
+    def test_continuous_worker_recovers_after_database_failure(self, run_cycle, signal_mock):
+        run_cycle.side_effect = [DatabaseError("database unavailable"), []]
+        call_command("run_worker", poll_seconds=0.01)
+        self.assertEqual(run_cycle.call_count, 2)
+
+    @patch("store.management.commands.run_worker.run_cycle")
+    def test_once_worker_reports_database_failure(self, run_cycle):
+        run_cycle.side_effect = DatabaseError("database unavailable")
+        with self.assertRaises(CommandError):
+            call_command("run_worker", once=True)
 
 
 class DatabaseTests(TestCase):

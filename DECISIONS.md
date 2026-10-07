@@ -5,7 +5,7 @@ Detailed rationale and earlier research live in [DECISION_CONTEXT.md](DECISION_C
 ## Invariants and selected semantics
 
 - A customer has at most one open cart; checkout freezes it and allows a new cart.
-- One cart creates at most one order, reservation, and payment attempt. Committed idempotency keys replay their original resource.
+- One cart creates at most one order, reservation, and payment attempt. Add idempotency replays an immutable response snapshot; checkout replays the original order's current state.
 - An inventory unit is `AVAILABLE`, `RESERVED` by one reservation, or `SOLD` by that reservation. A checkout allocates its entire cart or nothing.
 - A coupon is `AVAILABLE`, `RESERVED` by one order, or `REDEEMED` by that order. Definitive failure releases it; an unknown payment retains it.
 - Only the first successful finalization increments `Customer.orders_count`. Stored counts must equal confirmed orders.
@@ -80,9 +80,9 @@ Cart additions increase the existing line and reject a resulting quantity above 
 
 **Options considered:** Rely only on resource uniqueness, cache full responses, or persist operation/scope/key plus a canonical request fingerprint and result reference.
 
-**Choice:** Require `Idempotency-Key` for these three operations. Check committed records before current stock or coupon validation. Equal input returns the original resource; changed input returns 409. Records commit with the mutation, so rolled-back attempts do not consume keys. Checkout replay returns 202 while pending and 200 once terminal.
+**Choice:** Require `Idempotency-Key` for these three operations. Check committed records before current stock or coupon validation. Equal add input returns its original cart response snapshot; checkout returns the original order's current state; changed input returns 409. Records commit with the mutation, so rolled-back attempts do not consume keys. Checkout replay returns 202 while pending and 200 once terminal.
 
-**Why:** The result reference stays current for orders while preserving exact mutation identity. Add-item replay still points to the original cart after rollover.
+**Why:** Orders need a current status, while an add response must remain identical after subsequent quantity changes, deletion, or cart rollover. A legacy record without a recoverable snapshot returns a structured conflict.
 
 **Consequences:** Records are retained indefinitely for this assignment. Production needs retention, tenant scoping, and request-size limits.
 
@@ -100,9 +100,9 @@ Cart additions increase the existing line and reject a resulting quantity above 
 
 ## Errors, implementation scope, and validation
 
-Errors use `{error: {code, message, retryable, details?}}`: 400 invalid input, 404 missing resource, 409 stock/idempotency/state conflicts, and 503 transient contention. Structured logs include request IDs and omit request bodies, emails, and coupon values.
+Errors use `{error: {code, message, retryable, details?}}`: 400 invalid input, JSON 404 for malformed or unknown API paths, 409 stock/idempotency/state conflicts, 500 safe internal errors, and 503 transient contention. Structured logs include request IDs, allowlisted attempt/operation/status context, and exception diagnostics while omitting request bodies, emails, coupon values, and credentials.
 
-Implemented: customer/cart/product reads, inventory reservation, checkout snapshots, independent fake payment, leased recovery, coupon reservation and generation, customer counts, reporting, health checks, stable seed data, and deterministic demos. PostgreSQL tests cover retries, last-unit competition, simultaneous first cart creation, rollbacks, provider uncertainty, expiry, money, rewards, and reporting.
+Implemented: customer/cart/product reads, inventory reservation, checkout snapshots, independent fake payment, leased recovery, coupon reservation and generation, customer counts, reporting, health checks, stable seed data, and deterministic demos. PostgreSQL tests cover immutable add replay, retries, last-unit and coupon competition, customer-first finalization locking, rollback, provider uncertainty, zero-total recovery, worker database outages, expiry, money, rewards, and reporting.
 
 Deferred: authentication, product administration, real payments, refunds, cancellation after initiation, multiple payment attempts, taxes/shipping, multiple currencies or warehouses, coupon stacking/expiry, archival, metrics dashboards, and load-tested tuning.
 
@@ -110,6 +110,6 @@ Deferred: authentication, product administration, real payments, refunds, cancel
 
 AI helped enumerate failure modes and draft transaction boundaries. I rejected an earlier AI proposal for bounded inventory pools and refill coordination because unit rows meet this assignment with less operational state. I also corrected generated reporting tests to use `TransactionTestCase`; Django `TestCase` had already opened an outer transaction and could not establish Repeatable Read at the required boundary. All accepted code was exercised in PostgreSQL.
 
-Approximate time spent: 5½ hours across foundation, implementation, recovery demonstrations, tests, and documentation.
+Approximate time spent: six hours across foundation, implementation, recovery demonstrations, tests, review fixes, and documentation.
 
-With two more hours, I would first add coordinated tests for a worker losing its lease during provider latency, coupon competition, and a concurrent report/finalization snapshot. I would then measure lock-wait and worker-claim behavior with multiple processes, add metrics for pending age and retries, and tighten email validation and API schema generation.
+With two more hours, I would add coordinated report/finalization and overlapping multi-product rollback tests, then run multi-process load tests around allocation, worker claiming, and lease expiry. I would use those measurements to add pending-age, retry, and lock-wait metrics and tune polling and indexes.

@@ -63,13 +63,13 @@ Errors use a stable envelope. Validation is 400, missing resources 404, state or
 {"error":{"code":"insufficient_inventory","message":"Reduce the quantity to the available quantity.","retryable":false,"details":{"product_id":"…","requested":3,"available":1}}}
 ```
 
-A replay with the same key and input returns the original committed resource. Reusing a key with different input returns 409. Failed transactions do not consume keys.
+An add-item replay with the same key and input returns HTTP 200 and the exact cart snapshot produced by the original HTTP 201, even after later edits, deletion, checkout, or cart rollover. Checkout replay intentionally returns the original order's current state. Reusing a key with different input returns 409. Failed transactions do not consume keys. Legacy add records without a recoverable snapshot return a structured 409 instead of a server error.
 
 ## Payments and recovery
 
-`fake_payments` is routed to the separate `payments` database. Provider effects survive an application finalization rollback, and repeated provider keys cannot create another simulated charge. The worker claims up to ten rows with 30-second tokenized leases, marks initiation before payment, reconciles uncertain outcomes, and retries with capped exponential backoff. Five failed processing attempts or a pending age over 15 minutes is flagged without inventing an outcome.
+`fake_payments` is routed to the separate `payments` database. Provider effects survive an application finalization rollback, and repeated provider keys cannot create another simulated charge. The worker claims up to ten rows with 30-second tokenized leases, marks initiation before payment, reconciles uncertain outcomes, and retries with capped exponential backoff. Five failed processing attempts or a pending age over 15 minutes is flagged without inventing an outcome. The continuous worker logs database failures, closes stale connections, waits one poll interval, and retries; Compose also restarts it unless explicitly stopped. `--once` remains strict and exits nonzero on a database failure.
 
-Reservations expire after five minutes only before payment initiation. Initiated or unknown payments retain inventory and coupon holds until reconciliation. Run one attempt directly with:
+Reservations expire after five minutes only before payment initiation. Initiated or unknown payments retain inventory and coupon holds until reconciliation. A zero-total order stores a successful, initiated `zero-total` attempt in the checkout transaction and is finalized locally without calling either provider method. Run one attempt directly with:
 
 ```sh
 docker compose run --rm worker python manage.py run_worker --once --attempt-id UUID
@@ -81,6 +81,8 @@ docker compose run --rm worker python manage.py run_worker --once --attempt-id U
 
 Application data uses `default`; fake-provider data uses `payments`. Cross-database foreign keys are prohibited. Inventory is represented by individual rows and allocated in a short transaction using `SKIP LOCKED` plus bounded waiting. Reports use one read-only repeatable-read snapshot.
 
-This is a focused 4–6-hour assignment implementation. Deferred scope includes authentication, product administration, real payment integration, refunds, multiple payment attempts, multiple warehouses/currencies, coupon stacking/expiry, and measured throughput tuning. See [DECISIONS.md](DECISIONS.md) and [EDGE_CASES.md](EDGE_CASES.md).
+This is a submission-ready, focused six-hour assignment implementation; it is not described as production-deployed. Deferred scope includes authentication, product administration, real payment integration, refunds, multiple payment attempts, multiple warehouses/currencies, coupon stacking/expiry, and measured throughput tuning. Longer multi-product contention, report/finalization overlap, and load tests are also deferred. See [DECISIONS.md](DECISIONS.md) and [EDGE_CASES.md](EDGE_CASES.md).
+
+Unknown `/api/v1` paths, malformed path UUIDs, validation failures, and unexpected API exceptions all use the documented JSON error envelope. Server logs retain safe diagnostic exception data plus allowlisted request, attempt, operation, and status fields; request bodies, emails, coupon codes, and credentials are not logged by default.
 
 If readiness returns 503, inspect `docker compose logs db api` and confirm both databases exist. Rebuild with `docker compose build` after dependency or image configuration changes.

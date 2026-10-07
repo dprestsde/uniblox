@@ -32,7 +32,7 @@ class PaymentService:
         now = now or self.clock()
         with transaction.atomic():
             query = (
-                PaymentAttempt.objects.select_for_update(skip_locked=True)
+                PaymentAttempt.objects.select_for_update(skip_locked=True, of=("self",))
                 .filter(order__status=Order.Status.PENDING, next_retry_at__lte=now)
                 .filter(Q(lease_deadline__isnull=True) | Q(lease_deadline__lt=now))
                 .order_by("next_retry_at", "id")
@@ -54,7 +54,7 @@ class PaymentService:
     def _owned_attempt(attempt_id, token, *, lock=False):
         query = PaymentAttempt.objects
         if lock:
-            query = query.select_for_update()
+            query = query.select_for_update(of=("self",))
         return query.select_related("order").filter(id=attempt_id, lease_token=token).first()
 
     def _reschedule(self, attempt_id, token, message, now=None):

@@ -325,6 +325,59 @@ class CommerceTestCase(TransactionTestCase):
         self.assertEqual(order.failure_code, "reservation_expired")
         self.assertFalse(FakePayment.objects.using("payments").exists())
 
+    def test_payment_claim_locks_only_the_attempt_row(self):
+        self.add(1)
+        response = self.checkout()
+        order = Order.objects.get(id=response.data["id"])
+        order_locked = Event()
+        release_order = Event()
+        claim_finished = Event()
+        results = []
+        errors = []
+
+        def hold_order_lock():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    Order.objects.select_for_update().get(id=order.id)
+                    order_locked.set()
+                    release_order.wait(timeout=5)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        def claim_attempt():
+            close_old_connections()
+            try:
+                service = PaymentService()
+                claim = service.claim_due_attempt(attempt_id=order.payment_attempt.id)
+                with transaction.atomic():
+                    owned = service._owned_attempt(*claim, lock=True)
+                results.append((claim, owned.id))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                claim_finished.set()
+                close_old_connections()
+
+        locker = Thread(target=hold_order_lock)
+        claimant = Thread(target=claim_attempt)
+        locker.start()
+        self.assertTrue(order_locked.wait(timeout=5))
+        claimant.start()
+        completed_without_order_lock = claim_finished.wait(timeout=2)
+        release_order.set()
+        locker.join(timeout=5)
+        claimant.join(timeout=5)
+
+        self.assertFalse(locker.is_alive())
+        self.assertFalse(claimant.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(completed_without_order_lock)
+        self.assertEqual(results[0][0][0], order.payment_attempt.id)
+        self.assertEqual(results[0][1], order.payment_attempt.id)
+
     def test_reward_rounding_generation_and_report(self):
         self.add(1)
         response = self.checkout()

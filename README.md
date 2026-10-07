@@ -2,6 +2,8 @@
 
 A Django/PostgreSQL backend for reliable carts, inventory reservation, asynchronous fake payments, coupons, rewards, and reporting. Checkout commits durable intent first; a leased worker then resolves payment and atomically confirms or fails the order.
 
+Start with the short [`guide/guide.md`](guide/guide.md) for the coding standards, AI-assisted workflow, and production evolution path.
+
 ## Architecture
 
 HTTP traffic follows `urls.py → APIView → command serializer → class-based service → ORM`. Plain DRF serializers validate request bodies, path and query values, and idempotency headers before invoking services. Services own database reads, writes, transactions, locking, and state-dependent validation. Separate response serializers verify every service DTO before it is returned; an invalid internal DTO is logged and becomes a safe 500 response.

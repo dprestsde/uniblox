@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`task.md` is the assignment contract. Architecture and verification context live in `DECISIONS.md`, `DECISION_CONTEXT.md`, and `EDGE_CASES.md`. Django configuration is in `src/config/`. APIViews and strict request/response serializers live in `src/store/api/`. Domain classes live in `src/store/services/`; models and migrations remain in `src/store/`. `src/fake_payments/` contains the independently persisted provider adapter. Tests live in `tests/`; database initialization and automation live in `docker/`, `scripts/`, `compose.yaml`, and `Makefile`.
+`task.md` is the assignment contract. Architecture and verification context live in `DECISIONS.md`, `DECISION_CONTEXT.md`, and `EDGE_CASES.md`; short engineering notes are indexed by `guide/guide.md`. Django configuration is in `src/config/`. APIViews and strict request/response serializers live in `src/store/api/`. Domain classes live in `src/store/services/`; models and migrations remain in `src/store/`. `src/fake_payments/` contains the independently persisted provider adapter. Tests live in `tests/`; database initialization and automation live in `docker/`, `scripts/`, `compose.yaml`, and `Makefile`.
 
 ## Build, Test, and Development Commands
 

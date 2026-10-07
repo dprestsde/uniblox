@@ -1,55 +1,115 @@
 # Architecture Decisions
 
-Accepted planning decisions; implementation and validation are pending. Detailed notes: [DECISION_CONTEXT.md](DECISION_CONTEXT.md).
+Detailed rationale and earlier research live in [DECISION_CONTEXT.md](DECISION_CONTEXT.md). The implementation is constrained to the assignment’s 4–6-hour timebox.
 
-## Decision: Inventory units with durable reservations
+## Invariants and selected semantics
 
-**Context:** Prevent overselling, duplicate allocations, and stock stranded by failed checkouts.
+- A customer has at most one open cart; checkout freezes it and allows a new cart.
+- One cart creates at most one order, reservation, and payment attempt. Committed idempotency keys replay their original resource.
+- An inventory unit is `AVAILABLE`, `RESERVED` by one reservation, or `SOLD` by that reservation. A checkout allocates its entire cart or nothing.
+- A coupon is `AVAILABLE`, `RESERVED` by one order, or `REDEEMED` by that order. Definitive failure releases it; an unknown payment retains it.
+- Only the first successful finalization increments `Customer.orders_count`. Stored counts must equal confirmed orders.
+- Orders preserve product, price, coupon, gross, discount, and net snapshots; `gross - discount = net`.
+- Reward milestones count confirmed store-wide orders. Each program/milestone generates at most one coupon.
 
-**Options considered:** Locked product counters, conditional counter updates, bounded unit pools, Redis reservations, and one PostgreSQL row per inventory unit.
+Cart additions increase the existing line and reject a resulting quantity above current availability. Checkout rechecks availability. Current prices are frozen when the pending order is created. Failed orders are terminal. Authentication is omitted as permitted by `task.md`.
 
-**Choice:** Use Django and PostgreSQL with individual units (`AVAILABLE → RESERVED → SOLD`, or release back to `AVAILABLE`) and durable checkout reservations. Reserve the whole cart atomically. Use `SKIP LOCKED` with a bounded waiting fallback; contention is not a stockout. Unique checkout-attempt IDs prevent duplicate allocation. Lock reservation state so confirmation and release are mutually exclusive. Recover overdue holds according to payment outcome.
+## Decision: Individual inventory units and durable reservations
 
-**Why:** Independent units permit concurrent allocation without a shared reservation counter. Keeping reservations and inventory together provides transactional consistency without pool replenishment or cross-system coordination.
+**Context:** Concurrent carts must not oversell stock or report a false shortage merely because another allocator holds locks.
 
-**Consequences:** Storage and writes grow per unit. Availability is counted from available rows. Payment recovery follows the decision below; expiry timings and exact locking details remain pending. Benchmark before adding scaling mechanisms; verify concurrency using separate PostgreSQL connections.
+**Options considered:** A locked product counter, conditional counter updates, Redis holds, bounded unit pools, and one PostgreSQL row per unit.
 
-## Decision: Recoverable checkout with simulated payments
+**Choice:** Allocate ordered unit rows using `SELECT FOR UPDATE SKIP LOCKED` inside the pending-order transaction. If skipped locks explain a short allocation, retry with bounded waiting: two-second lock timeout and five-second overall budget. True shortage returns requested and available quantities; exhausted contention returns retryable 503.
 
-**Context:** Payment can succeed or fail while the corresponding order update fails; retries must not charge or finalize twice.
+**Why:** Unit ownership makes duplicate allocation impossible and keeps reservation state in the same transaction as the order and coupon. The waiting path distinguishes contention from stockout.
 
-**Options considered:** Treat database commit as payment success, or simulate an independent payment lifecycle with reconciliation.
+**Consequences:** Storage and writes scale per unit, and availability uses counts. This is clear for assignment volume; measured pressure could justify product-level conditional counters or partitioned unit pools later.
 
-**Choice:** Atomically persist one pending order per cart, inventory reservation, and payment attempt before contacting an idempotent fake provider. Persist provider outcomes outside the order transaction. Finalize success or failure atomically with inventory changes; leave unknown outcomes pending. Use leased PostgreSQL work records for retry and reconciliation. Return the existing order on retries and HTTP 202 while pending.
+## Decision: Durable asynchronous checkout and independent fake payments
 
-**Why:** Durable intent and repeatable finalization recover from crashes and lost responses without a message broker or real payment integration.
+**Context:** Payment may persist while local confirmation fails, or its response may be lost.
 
-**Consequences:** Initially allow one payment attempt per order; failed orders are terminal. Retain inventory while payment is unresolved. Use backoff, worker leases, and monitoring; defer automatic release during prolonged provider outages and late-success refunds. Validate failure injection and concurrent recovery before claiming reliability at scale.
+**Options considered:** Treat checkout commit as payment success, call payment inside the order transaction, or persist intent and reconcile an idempotent provider.
 
-## Decision: Coupon reservation tied to order recovery
+**Choice:** Checkout atomically creates a pending order, immutable items, inventory/coupon holds, payment attempt, frozen cart, and idempotency record. The provider uses a separate database and a unique provider key. A leased worker contacts or queries it, stores known outcomes, then calls one idempotent local finalizer. Unknown outcomes remain pending.
 
-**Context:** Concurrent discounted checkouts must not consume the same coupon; failed orders must not lose it.
+**Why:** Provider effects survive application rollback, while repeated keys prevent duplicate simulated charges. Recovery covers crashes, lost responses, failed success-finalization, and failed failure-finalization.
 
-**Options considered:** Redeem before payment, redeem after payment without a hold, or reserve before payment and finalize with the order.
+**Consequences:** Clients receive 202 and poll orders. Before initiation, a five-minute expiry may fail and release the order. After initiation, holds remain until reconciliation. Refunds for an eventual late success are deferred.
 
-**Choice:** Lock one coupon row and reserve it atomically with the pending order and inventory. Use `AVAILABLE → RESERVED → REDEEMED`, releasing to available on definitive failure. Redeem/release in the order finalization transaction after verifying ownership. Unknown payment outcomes retain the hold; retries are harmless.
+## Decision: PostgreSQL locks, leases, and explicit transaction boundaries
 
-**Why:** Establishes exclusive ownership before charging and reuses existing recovery without a separate coupon worker or reservation table.
+**Context:** Multiple API and worker instances must coordinate without an in-process mutex or broker.
 
-**Consequences:** One bearer coupon per order, no stacking or expiry. Freeze discount terms before payment; never silently charge full price. Include reserved coupons in reporting. Generation milestones and rounding remain separate decisions.
+**Options considered:** Global serialization, a message broker, advisory locks, or row locks plus a database work queue.
 
-## Decision: Minimal customer identity and confirmed-order count
+**Choice:** Use short explicit transactions and acquire business rows in the common order Customer, Cart, Order, PaymentAttempt, Reservation, Coupon, then InventoryUnit by product/unit ID. Queue claims lock only due attempt rows and commit before provider I/O. Thirty-second leases carry ownership tokens; stale workers cannot schedule or persist local attempt state. Retries use capped exponential backoff with deterministic jitter.
 
-**Context:** Associate carts and purchases with a customer and expose their successful purchase count.
+**Why:** PostgreSQL already provides durable coordination across processes. Token fencing preserves correctness after lease expiry; provider idempotency and terminal state checks remain the ultimate safeguards.
 
-**Options considered:** Anonymous cart IDs, a full account system, or a minimal customer record.
+**Consequences:** Polling and connection use are the initial scaling limits. Batch size is ten, polling defaults to five seconds, and attempts are flagged after five failures or 15 pending minutes. Throughput is unmeasured; a broker, partitioning, and provider rate controls follow evidence.
 
-**Choice:** Include `Customer(id, name, email, orders_count)`. Initialize the count to zero and increment it only on the first transition to a confirmed order, atomically with finalization. Clients cannot set the count.
+## Decision: Coupon ownership follows order recovery
 
-**Why:** Provides customer ownership without authentication scope; transactional counting keeps retries and failures from inflating purchase history.
+**Context:** A coupon cannot be used twice or disappear after a failed purchase.
 
-**Consequences:** Link carts to customers and derive order ownership through the immutable cart relationship. Concurrent confirmations must use atomic increments. Reconcile counts against confirmed orders; reward milestone scope remains a separate decision.
+**Options considered:** Redeem before payment, redeem after payment without a hold, or reserve with the pending order.
 
-## AI use
+**Choice:** Lock and reserve an available coupon in the checkout transaction. Success redeems it; definitive failure verifies ownership then releases it. Failed-order history stays in the order snapshot after current ownership clears.
 
-Deepak rejected the assistant’s proposed bounded-pool complexity; the accepted design uses individual units and durable reservations. No implementation has been validated yet.
+**Why:** Exclusivity is established before payment, while all local success or failure effects commit together.
+
+**Consequences:** One coupon per order, without stacking or expiry. Unknown outcomes reduce coupon availability until reconciliation.
+
+## Decision: Exact money and immutable purchase explanations
+
+**Context:** Retried payments, price changes, and percentage rounding must produce the same charge and report.
+
+**Options considered:** Decimal database amounts, floating point, line-level rounding, or integer minor units with order-level rounding.
+
+**Choice:** Use USD integer cents. At checkout, `gross = sum(price × quantity)`, `discount = (gross × percent + 50) // 100`, and `net = gross - discount`. Round half-up once on the subtotal and reject totals above the supported integer bound. A 100% coupon follows normal finalization without a provider call.
+
+**Why:** Integer arithmetic is deterministic and snapshots explain historical totals even after product changes.
+
+**Consequences:** Multiple currencies, tax, shipping, and alternate rounding regimes require an explicit future money model.
+
+## Decision: Keyed idempotency with committed result references
+
+**Context:** Lost HTTP responses cause clients to retry additions, checkout, and coupon generation.
+
+**Options considered:** Rely only on resource uniqueness, cache full responses, or persist operation/scope/key plus a canonical request fingerprint and result reference.
+
+**Choice:** Require `Idempotency-Key` for these three operations. Check committed records before current stock or coupon validation. Equal input returns the original resource; changed input returns 409. Records commit with the mutation, so rolled-back attempts do not consume keys. Checkout replay returns 202 while pending and 200 once terminal.
+
+**Why:** The result reference stays current for orders while preserving exact mutation identity. Add-item replay still points to the original cart after rollover.
+
+**Consequences:** Records are retained indefinitely for this assignment. Production needs retention, tenant scoping, and request-size limits.
+
+## Decision: Store-wide rewards and snapshot-consistent reporting
+
+**Context:** Coupon generation must not skip or duplicate milestones, and multi-query reports must reconcile during concurrent finalization.
+
+**Options considered:** Generate coupons during checkout, derive them on read, or use an administrator action protected by the reward-program row.
+
+**Choice:** Seed immutable defaults `n=5`, `x=10`. A keyed administrator action locks the program, counts confirmed orders, and creates the oldest missing eligible milestone under a unique program/milestone constraint. Reports run their aggregates in a read-only Repeatable Read transaction and use order snapshots.
+
+**Why:** Generation remains explicit as required, missed milestones remain recoverable, and all report values share one database snapshot.
+
+**Consequences:** Configuration changes and multiple reward programs are deferred. Reports verify revenue and coupon accounting but do not repair inconsistencies.
+
+## Errors, implementation scope, and validation
+
+Errors use `{error: {code, message, retryable, details?}}`: 400 invalid input, 404 missing resource, 409 stock/idempotency/state conflicts, and 503 transient contention. Structured logs include request IDs and omit request bodies, emails, and coupon values.
+
+Implemented: customer/cart/product reads, inventory reservation, checkout snapshots, independent fake payment, leased recovery, coupon reservation and generation, customer counts, reporting, health checks, stable seed data, and deterministic demos. PostgreSQL tests cover retries, last-unit competition, simultaneous first cart creation, rollbacks, provider uncertainty, expiry, money, rewards, and reporting.
+
+Deferred: authentication, product administration, real payments, refunds, cancellation after initiation, multiple payment attempts, taxes/shipping, multiple currencies or warehouses, coupon stacking/expiry, archival, metrics dashboards, and load-tested tuning.
+
+## AI use, time spent, and next work
+
+AI helped enumerate failure modes and draft transaction boundaries. I rejected an earlier AI proposal for bounded inventory pools and refill coordination because unit rows meet this assignment with less operational state. I also corrected generated reporting tests to use `TransactionTestCase`; Django `TestCase` had already opened an outer transaction and could not establish Repeatable Read at the required boundary. All accepted code was exercised in PostgreSQL.
+
+Approximate time spent: 5½ hours across foundation, implementation, recovery demonstrations, tests, and documentation.
+
+With two more hours, I would first add coordinated tests for a worker losing its lease during provider latency, coupon competition, and a concurrent report/finalization snapshot. I would then measure lock-wait and worker-claim behavior with multiple processes, add metrics for pending age and retries, and tighten email validation and API schema generation.

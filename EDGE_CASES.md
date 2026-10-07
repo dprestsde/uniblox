@@ -1,151 +1,56 @@
 # Edge Cases and Verification Context
 
-Planning checklist for implementing `task.md`. Accepted architecture is summarized in [DECISIONS.md](DECISIONS.md), with details in [DECISION_CONTEXT.md](DECISION_CONTEXT.md). No cases have been implemented or verified yet.
+This is the acceptance map for `task.md`. `tests/test_commerce.py` uses PostgreSQL `TransactionTestCase`; `tests/test_foundation.py` covers infrastructure. `make demo` exercises independent provider persistence and recovery faults.
 
-Pricing, rounding, coupon-generation milestones, and report snapshot rules below use proposed defaults that still need acceptance. Additional proposed behaviors are explicitly labeled. Saving this checklist does not mark those choices accepted.
+## Verified automated behavior
 
-## Customers and order counts
+| Area | Cases and invariant | Verification |
+| --- | --- | --- |
+| Customers | Required input, normalized email, duplicate conflict, read-only count | `test_customer_normalization_duplicate_and_read_only_count` |
+| Cart identity | Concurrent first additions create one open cart; checkout permits a later new cart | `test_concurrent_first_additions_share_one_open_cart`, `test_new_purchase_gets_a_new_open_cart` |
+| Cart input | Addition replay does not add twice; changed keyed input conflicts; booleans and excess quantities fail | `test_add_is_idempotent_and_rejects_invalid_or_excess_quantity` |
+| Price history | Checkout freezes product name, price, quantities, and totals | `test_checkout_reserves_snapshot_and_replays_terminal_order` |
+| Inventory | Competing buyers cannot reserve the last unit twice; pending checkout owns one unit | `test_last_unit_competition_has_one_winner`, checkout tests |
+| Checkout replay | Lost-response replay returns the original pending or terminal order; no second order/payment exists | `test_checkout_reserves_snapshot_and_replays_terminal_order` |
+| Coupon failure | A failed payment releases only its owned coupon and inventory | `test_payment_failure_releases_inventory_and_coupon` |
+| Provider idempotency | Provider state is on `payments`; a persisted result is queried without another charge | `test_lost_provider_response_and_failed_local_confirmation_recover` |
+| Local rollback | Injected failure after success writes rolls back order, units, coupon/count changes; retry finalizes once | Same test and `make demo` |
+| Failure-finalization rollback | A failed payment plus failed local failure update remains recoverable | `make demo` scenario `failed-failure-finalization` |
+| Unknown outcome | Lost response retains holds, reschedules, and later confirms from provider status | Lost-response test and demo |
+| Expiry race rule | Pre-initiation expiry fails without provider persistence; initiated work is reconciled | `test_expiry_before_initiation_does_not_call_provider` |
+| Rewards | Only confirmed orders qualify; generation is keyed and replays one milestone | `test_reward_rounding_generation_and_report` |
+| Money | Integer cents, order-level half-up boundary, historical totals, balanced report revenue | `test_half_up_rounding_is_applied_once_to_subtotal`, report test |
+| Reporting | Confirmed-only revenue and quantities, coupon accounting, no read mutation | `test_reward_rounding_generation_and_report` |
+| Database routing | Provider and application aliases use distinct databases and routing | `DatabaseConfigurationTests` |
+| Health/worker | Readiness fails generically when a database is unavailable; one-cycle worker exits | Foundation tests and `make worker-once` |
 
-| Case | Expected behavior |
-| --- | --- |
-| Missing name or invalid email | Reject customer input. |
-| Unknown customer when creating/locating a cart | Missing-resource error; do not silently create a customer. |
-| Client supplies `orders_count` | Reject as read-only; never trust client purchase counts. |
-| New customer | Count starts at zero. |
-| Pending or failed order | Count does not increase. |
-| First successful order confirmation | Increment once in the finalization transaction. |
-| Duplicate confirmation or reconciliation | No additional increment. |
-| Local confirmation rolls back after count update | Count rolls back too; recovery increments on successful commit. |
-| Concurrent successful orders for one customer | Atomic increments preserve both successes. |
-| Count reconciliation | Stored count matches the customer's confirmed orders in a consistent snapshot. |
+## Enforced by service and database constraints
 
-## Products and carts
+The API rejects unknown customers, products, carts, coupons, empty carts, zero/negative/fractional quantities, frozen-cart edits, and totals beyond the supported bound. Cart updates use absolute quantities; repeated deletion from an open cart is harmless. Cart additions use current availability without reserving, while checkout rechecks inside its transaction.
 
-| Case | Expected behavior |
-| --- | --- |
-| Unknown product or cart | Clear missing-resource error; no mutation. |
-| Zero, negative, fractional, or malformed quantity | Reject; use the removal operation to remove an item. |
-| Same product added again | One cart line; proposed behavior: increase quantity. |
-| Quantity exceeds current availability | Proposed behavior: permit cart intent, show availability, enforce stock at checkout. Carts do not reserve inventory. |
-| Empty cart checkout | Reject before creating an order or contacting payment. |
-| Concurrent cart edits | Serialize through the cart; avoid lost updates. |
-| Cart edit races with checkout | Cart locking determines the purchase snapshot. |
-| Edit after pending order creation | Proposed policy: reject and preserve the order snapshot. |
-| Price changes after adding to cart | Proposed policy: use checkout-time price, then freeze it. |
-| Product changes after order creation | Preserve historical name, quantity, prices, and totals. |
+Conditional uniqueness enforces one open cart per customer. Unique constraints enforce one order per cart, one reservation and payment attempt per order, one product line per cart/order, one idempotency operation/scope/key, and one coupon per reward milestone. Check constraints enforce positive quantities, balanced nonnegative money, valid percentages, and inventory/coupon state ownership.
 
-## Inventory reservation
+Checkout locks Customer → Cart → Coupon → ordered InventoryUnit rows. Partial multi-product allocation, coupon reservation, order creation, and idempotency commit in one transaction, so any exception rolls everything back. `SKIP LOCKED` short allocation with sufficient visible units takes the waiting path; a true shortage returns product, requested, and available values. A five-second exhausted contention budget returns retryable 503.
 
-| Case | Expected behavior |
-| --- | --- |
-| Two buyers request the last unit | At most one reserves it. |
-| Overlapping quantity requests | Never allocate one unit to multiple reservations. |
-| One item in a multi-product cart lacks stock | Roll back all allocation for that checkout. |
-| `SKIP LOCKED` returns too few rows | Retry through the bounded waiting path; do not infer stockout from skipped locks. |
-| Lock deadline exceeded | Retryable busy response; no partial allocation remains. |
-| Crash before transaction commit | No durable allocation changes. |
-| Commit succeeds but response is lost | Retry returns the existing reservation/order. |
-| Repeated release | Return each reserved unit to availability once. |
-| Confirmation races with release | Exactly one terminal transition succeeds. |
-| Overdue reservation with unknown payment | Retain and reconcile, rather than independently release. |
-| Displayed stock becomes unavailable | Validate at checkout; displayed availability is a snapshot. |
+Finalization locks the pending order, attempt, reservation, coupon, and units. Matching repeated terminal transitions do nothing; conflicting transitions fail. `F()` increments protect concurrent customer confirmations. Failed-order coupon history remains on the immutable order snapshot after ownership is released.
 
-## Checkout and order idempotency
+Worker claims use `SKIP LOCKED`, 30-second leases, and unique fencing tokens. Provider calls occur after claim commit. Known outcomes persist before local finalization; stale tokens cannot write scheduling state. Retries use exponential backoff with jitter capped at 60 seconds and flag repeated or old work without fabricating payment failure.
 
-| Case | Expected behavior |
-| --- | --- |
-| Concurrent identical requests | One order, reservation, and payment attempt. |
-| Different request IDs for one cart | Database uniqueness prevents a second order. |
-| Request identity reused with different purchase intent/coupon | Conflict, not a new purchase. |
-| Retry while processing | Return existing pending order with HTTP 202. |
-| Retry after confirmation | Return existing confirmed order. |
-| Retry after definitive payment failure | Return terminal failed order; no new charge. |
-| Validation fails before initial commit | No durable order/payment attempt or partial holds; cart remains editable. |
-| Confirmation response lost | Retry or order-status lookup returns committed result. |
+## Deterministic demonstration matrix
 
-## Fake payment provider
+`make demo` creates isolated data and prints before, first-attempt, recovery, and final states for:
 
-| Case | Expected behavior |
-| --- | --- |
-| Success | Local finalization confirms order. |
-| Definitive failure | Local finalization fails order and releases resources. |
-| Repeated payment key | Same outcome, at most one simulated charge. |
-| Same key, different amount | Reject mismatch. |
-| Payment processed but response lost | Status lookup reveals persisted outcome. |
-| Timeout with uncertain outcome | Keep unknown; do not assume failure. |
-| Crash before provider call | Recovery resumes the same attempt. |
-| Status temporarily unavailable | Retry with backoff. |
-| Order transaction rolls back | Independently persisted provider outcome survives. |
+1. ordinary payment success;
+2. definitive payment failure and release;
+3. timeout/expiry before provider initiation;
+4. provider persistence followed by a lost response;
+5. payment success followed by failed local confirmation;
+6. payment failure followed by failed local failure-finalization.
 
-Provide deterministic failure injection for tests and demonstrations, not random-only failures.
+One-shot local fault flags are consumed outside the deliberately failed transaction, allowing the next worker cycle to prove recovery. The regular worker is stopped for deterministic injection and restarted afterward.
 
-## Finalization and recovery
+## Explicitly deferred or requiring deeper stress coverage
 
-| Case | Expected behavior |
-| --- | --- |
-| Payment succeeds, confirmation transaction fails | Pending order and resource holds remain; recovery confirms later. |
-| Payment fails, local failure update succeeds | Fail order and release inventory/coupon. |
-| Payment fails, local failure update also fails | Keep pending; recovery retries failure finalization. |
-| Failure midway through finalization | Roll back order, inventory, and coupon changes together. |
-| Two workers process one attempt | Only one finalization changes state. |
-| Worker crashes while holding lease | Another worker resumes after expiry. |
-| Old worker resumes after lease reassignment | Ownership token prevents stale scheduling writes. |
-| Reconciliation repeats after completion | No duplicate charge, sale, redemption, or release. |
-| Cancellation races with payment initiation | Durable state prevents paying against a released reservation. |
-| Persistent recovery errors | Preserve recoverable state and flag for attention. |
+The implementation does not support malformed external provider callbacks, refunds or late success after forced release, cancellation after initiation, multiple payment attempts, coupon stacking/expiry, multiple currencies, multiple warehouses, taxes, shipping, or product deletion. These are deferred product scope, not silent behavior.
 
-## Coupon reservation and redemption
-
-| Case | Expected behavior |
-| --- | --- |
-| Unknown code | Reject before payment. |
-| Already redeemed | Distinct conflict. |
-| Reserved by another order | `coupon_reserved`; never silently charge full price. |
-| Concurrent use of available coupon | Only one checkout reserves it and proceeds to payment. |
-| Inventory allocation fails | Coupon reservation rolls back. |
-| Unknown payment | Keep coupon reserved. |
-| Failed payment | Release coupon atomically with inventory and order failure. |
-| Successful payment, failed confirmation | Recovery redeems with order confirmation. |
-| Stale release after coupon is assigned elsewhere | Ownership check prevents mutation. |
-| Discount terms change later | Preserve frozen order discount and payment amount. |
-
-## Coupon generation — proposed milestone semantics
-
-| Case | Expected behavior |
-| --- | --- |
-| Fewer than n confirmed orders | No coupon generated. |
-| Exactly n confirmed orders | One eligible milestone. |
-| Pending/failed orders | Do not advance eligibility. |
-| Accumulated milestones | Generate oldest unrewarded milestone; retain other eligibility. |
-| Concurrent generation requests | At most one coupon per milestone. |
-| Generation transaction fails | Milestone remains eligible. |
-| Discounted order confirms | Counts as a successful order. |
-| Generation response lost | No duplicate milestone; next request may generate the next eligible milestone. Request-level replay is not proposed initially. |
-| Invalid configuration | Reject n < 1 and unsupported discount percentages; proposed range is 1–100. |
-
-## Money and totals — proposed rules
-
-- Use one currency and integer minor units; round discount half-up once at order level.
-- Verify fractional-minor-unit discounts round deterministically.
-- A 100% discount yields zero, never a negative total.
-- Proposed zero-total behavior: confirm without a provider charge; preserve atomic finalization and idempotency.
-- Validate large quantities and amounts against supported limits.
-- Retries use frozen totals; later product changes do not alter historical orders.
-- Gross minus discount equals net.
-
-## Reporting — proposed consistency rules
-
-- Exclude pending and failed orders from purchased quantities and revenue.
-- Count retries and recovered confirmations only once.
-- Derive historical revenue from order snapshots.
-- Reconcile gross minus discounts equals net.
-- Reconcile generated coupons equals available plus reserved plus redeemed (accepted coupon accounting).
-- Return consistent zero values before any orders exist.
-- Use one consistent database snapshot while concurrent finalizations occur.
-- Reads never generate coupons, release reservations, or otherwise mutate state.
-
-## Deferred scope and test strategy
-
-Defer real-provider integration, refunds after forced release of uncertain payments, multiple payment attempts on one order, coupon expiry/stacking, multiple currencies, and multi-warehouse allocation. Single-currency and warehouse scope are proposed defaults.
-
-Group related cases into focused tests. Prioritize concurrent allocation, duplicate requests, atomic rollback, and recovery after a persisted payment outcome. Run concurrency tests against PostgreSQL with separate connections and coordinated overlap; assert persisted state as well as responses. Do not claim coverage until tests are implemented and pass.
+Focused concurrency tests prove the principal cart and inventory invariants, but the following deserve longer stress tests: overlapping multi-product allocations with an observed blocking rollback, two workers crossing an actual lease-expiry boundary, stale-worker resumption during provider latency, simultaneous coupon checkout, concurrent milestone requests, and a report held open while another connection finalizes. The corresponding uniqueness, lock, fencing, and isolation mechanisms are implemented; no throughput claim is made without those measurements.

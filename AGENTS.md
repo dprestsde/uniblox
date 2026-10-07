@@ -2,20 +2,20 @@
 
 ## Project Structure & Module Organization
 
-`task.md` defines the checkout assignment. `DECISIONS.md`, `DECISION_CONTEXT.md`, and `EDGE_CASES.md` record accepted architecture and pending product rules. The foundation lives in `src/config/` (Django settings, routing, logging), `src/store/` (API, service, payment interface, worker entry point), and `src/fake_payments/` (future independent fake-provider persistence). Foundation tests live in `tests/`; Docker initialization lives in `docker/`. Domain models and checkout behavior are not implemented yet.
+`task.md` is the assignment contract. Architecture and verification context live in `DECISIONS.md`, `DECISION_CONTEXT.md`, and `EDGE_CASES.md`. Django configuration is in `src/config/`. The `src/store/` app owns commerce models, HTTP views, transaction services, payment recovery, and management commands. `src/fake_payments/` contains the independently persisted provider simulator. Tests live in `tests/`; database initialization and automation live in `docker/`, `scripts/`, `compose.yaml`, and `Makefile`.
 
 ## Build, Test, and Development Commands
 
-Start Docker Desktop, then run `make setup` to create local configuration, build images, start PostgreSQL, and migrate both databases. `make up` starts the API and worker; `make down` stops them without deleting data. `make logs` follows service output. `make check` runs Django checks and migration-drift detection; `make lint` runs Ruff; `make test` runs tests against isolated PostgreSQL databases; `make worker-once` exercises the worker entry point. See `README.md` for equivalent Compose commands and troubleshooting.
+Run `make setup` once to create `.env`, build images, migrate both databases, and seed demo data. Use `make up`, `make down`, and `make logs` for daily development. `make check` runs Django checks and migration-drift detection. `make lint` checks Ruff lint and formatting; `make format` applies formatting. `make test` runs the suite against isolated PostgreSQL databases. `make demo` exercises payment and local-finalization recovery; `make worker-once` drains one worker batch.
 
 ## Coding Style & Naming Conventions
 
-Use Python 3.13, four-space indentation, descriptive domain names, and Ruff formatting (`make format`) and linting. Keep HTTP views thin; put business transitions in explicit services and database transactions. Keep fake-provider effects on the `payments` database alias and application state on `default`. Do not add cross-database relationships or perform provider calls inside application transactions.
+Use Python 3.13, four-space indentation, descriptive domain names, and Ruff. Keep views focused on HTTP parsing and serialization. Put state transitions in `src/store/services/` under explicit `transaction.atomic()` boundaries. Acquire business locks in the documented order. Never call a payment provider inside an application database transaction or add cross-database model relationships.
 
 ## Testing Guidelines
 
-Use Django's test runner and DRF's API client. Name tests after observable behavior, such as `test_retry_returns_existing_order`. Use PostgreSQL and separate connections for concurrency tests; Django `TransactionTestCase` is appropriate for lock behavior. Assert final persisted state as well as responses. Prioritize the overlapping requests and recovery failures listed in `EDGE_CASES.md`. Run `make check`, `make lint`, and `make test` before submitting changes.
+Use Django’s test runner, DRF’s API client, and PostgreSQL. Name tests for observable behavior, such as `test_last_unit_competition_has_one_winner`. Use `TransactionTestCase`, separate connections, and coordination barriers for lock behavior. Assert responses and durable state across both database aliases. Map new edge cases in `EDGE_CASES.md`, then run `make check`, `make lint`, and `make test`.
 
 ## Commit & Pull Request Guidelines
 
-Use focused commits with imperative subjects, for example `Add PostgreSQL readiness checks`. PRs should describe behavior, linked requirements, and validation. Update endpoint documentation in `README.md` when contracts change. Keep `DECISIONS.md` concise but complete against `task.md`; place detailed context in `DECISION_CONTEXT.md`. Never commit `.env`, credentials, or private AI transcripts.
+Use focused imperative commits, for example `Add leased payment recovery worker`. PRs should explain behavior, invariants, deferred limits, and validation. Update README examples when contracts change. Never commit `.env`, credentials, generated caches, or private AI transcripts.

@@ -1,53 +1,86 @@
 # Checkout and Rewards Service
 
-This repository currently contains the **development foundation only**. Customer and cart operations, inventory reservation, order/payment flows, coupons, reporting, and seed data are planned in [DECISIONS.md](DECISIONS.md), [DECISION_CONTEXT.md](DECISION_CONTEXT.md), and [EDGE_CASES.md](EDGE_CASES.md); they are not implemented.
+A Django/PostgreSQL backend for reliable carts, inventory reservation, asynchronous fake payments, coupons, rewards, and reporting. Checkout commits durable intent first; a leased worker then resolves payment and atomically confirms or fails the order.
 
-## Prerequisites and startup
+## Run locally
 
-Install Docker Desktop with Compose and `make`, then start the Docker daemon. Python is supplied by the application image; the host Python is used only to prepare `.env`.
+Requirements: Docker Desktop with Compose and `make`.
 
 ```sh
-make setup
-make up
-curl http://127.0.0.1:8000/health/live
+make setup        # configure, build, migrate both databases, and seed
+make up           # start API and payment worker
 curl http://127.0.0.1:8000/health/ready
+make demo         # run payment failure and recovery demonstrations
 ```
 
-`make setup` checks Docker, creates `.env` if absent with a generated development secret, builds the application image, starts PostgreSQL, and migrates both database aliases. Existing `.env` values are never overwritten. The API and worker start with `make up`. If port 8000 is occupied, change its host mapping in `compose.yaml`.
+`make down` preserves PostgreSQL data. `docker compose down --volumes` deliberately deletes it. Setup never overwrites an existing `.env`.
 
-Only `GET /health/live` and `GET /health/ready` exist. Liveness does not access the database. Readiness checks both configured databases and returns a generic JSON 503 when either is unavailable. There are no customer, product, cart, order, payment, or administration endpoints yet.
-
-## Commands
-
-| Command | Compose equivalent or effect |
+| Command | Purpose |
 | --- | --- |
-| `make setup` | Prepare `.env`; `docker compose build`; `docker compose up -d --wait db`; migrate both aliases |
-| `make up` | `docker compose up -d --wait api worker` |
-| `make down` | `docker compose down` (keeps database data) |
-| `make logs` | `docker compose logs -f api worker` |
-| `make migrate` | `docker compose run --rm api python manage.py migrate --database default --noinput`, then repeat for `payments` |
-| `make check` | `docker compose run --rm api python manage.py check` and `makemigrations --check --dry-run` |
-| `make lint` | Run `ruff check` and `ruff format --check` in the API image |
-| `make format` | Run `ruff format` explicitly in the API image |
-| `make test` | `docker compose run --rm api python manage.py test tests --settings=config.test_settings` |
-| `make worker-once` | `docker compose run --rm worker python manage.py run_worker --once` |
+| `make migrate` | Apply migrations to application and provider databases |
+| `make seed` | Idempotently create two customers, five products, scarce stock, and rewards |
+| `make check` | Run Django and migration-drift checks |
+| `make lint` / `make format` | Check or apply Ruff rules |
+| `make test` | Run tests in isolated PostgreSQL databases |
+| `make worker-once` | Process at most ten due payment attempts and exit |
+| `make logs` | Follow API and worker JSON logs |
 
-The worker currently logs `worker_idle_no_handlers_registered` and reports zero processed jobs. It has no payment or reservation handlers. Continuous mode polls at `WORKER_POLL_SECONDS`; Ctrl-C or Compose shutdown stops it cleanly.
+The equivalent pattern is `docker compose run --rm api python manage.py <command>`. For example, `make seed` runs `docker compose run --rm api python manage.py seed_demo`.
 
-## Database and configuration
+## API
 
-PostgreSQL initializes `uniblox` for application data and `uniblox_payments` for future fake-provider effects. Django aliases are `default` and `payments`. The router directs `fake_payments` models to the latter and other models to the former. Future migrations must run against both aliases. Tests use separate `test_uniblox` and `test_uniblox_payments` databases. Cross-database model relations are not supported.
+All bodies are JSON. Mutations marked **keyed** require `Idempotency-Key`. IDs are UUIDs and money is integer USD cents.
 
-The named `pgdata` volume persists between `make down` and `make up`. To deliberately delete local data, run `docker compose down --volumes`; this is destructive. If database names or credentials change after initialization, use a fresh volume or update PostgreSQL manually, because initialization scripts run only for a new volume.
+| Method and path | Success | Behavior |
+| --- | --- | --- |
+| `POST /api/v1/customers` | 201 | Create from `{"name":"Ada","email":"ada@example.test"}` |
+| `GET /api/v1/customers/{id}` | 200 | Return identity and confirmed `orders_count` |
+| `GET /api/v1/products[/{id}]` | 200 | Return current price and available units |
+| `GET /api/v1/customers/{id}/cart` | 200 | Read the open cart; 404 if absent |
+| `PUT /api/v1/customers/{id}/cart` | 200/201 | Return or create an empty open cart |
+| `POST /api/v1/customers/{id}/cart/items` | 201 | **Keyed.** Add `{"product_id":"…","quantity":2}`; creates cart |
+| `GET /api/v1/carts/{id}` | 200 | Open cart uses current prices; frozen cart uses order snapshot |
+| `PATCH /api/v1/carts/{id}/items/{product_id}` | 200 | Set absolute `{"quantity":2}` |
+| `DELETE /api/v1/carts/{id}/items/{product_id}` | 204 | Remove; repeated open-cart removal is harmless |
+| `POST /api/v1/carts/{id}/checkout` | 202/200 | **Keyed.** Optional `{"coupon_code":"…"}`; 202 while pending |
+| `GET /api/v1/orders/{id}` | 200 | Return state, snapshots, totals, and failure code |
+| `POST /api/v1/admin/coupons/generate` | 201/200 | **Keyed.** Generate the oldest eligible milestone |
+| `GET /api/v1/admin/coupons` | 200 | Paginated coupon states |
+| `GET /api/v1/admin/reports/summary` | 200 | Repeatable-read business totals |
 
-`.env.example` contains local-only defaults. `.env` is ignored by Git. The application image pins Python and uv; `uv.lock` freezes application and development dependencies. Both Django database connections use explicit transactions where needed later; per-request transactions are disabled. All timestamps use UTC.
+List endpoints accept `page` and `page_size` (maximum 100) and use stable ordering. Administration endpoints intentionally have no authentication for this assignment.
 
-## Troubleshooting and verification
+```sh
+curl -X POST http://127.0.0.1:8000/api/v1/carts/$CART_ID/checkout \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: checkout-001' \
+  -d '{"coupon_code":"REWARD-1-ABC123"}'
+```
 
-- `make setup` says Docker is unavailable: start Docker Desktop, then rerun it.
-- Readiness returns 503: inspect `docker compose logs db api` and verify both databases were initialized.
-- Container startup fails after dependency changes: run `docker compose build` and then `make up`.
-- Worker reports no handlers: expected until business processing is implemented.
-- The test command creates and destroys dedicated PostgreSQL test databases; it does not modify development data.
+Errors use a stable envelope. Validation is 400, missing resources 404, state or stock conflicts 409, and exhausted lock contention 503:
 
-CI runs setup, health checks, migration drift checks, lint, tests, and a one-cycle worker run on GitHub Actions. No remote repository or deployment is configured here.
+```json
+{"error":{"code":"insufficient_inventory","message":"Reduce the quantity to the available quantity.","retryable":false,"details":{"product_id":"…","requested":3,"available":1}}}
+```
+
+A replay with the same key and input returns the original committed resource. Reusing a key with different input returns 409. Failed transactions do not consume keys.
+
+## Payments and recovery
+
+`fake_payments` is routed to the separate `payments` database. Provider effects survive an application finalization rollback, and repeated provider keys cannot create another simulated charge. The worker claims up to ten rows with 30-second tokenized leases, marks initiation before payment, reconciles uncertain outcomes, and retries with capped exponential backoff. Five failed processing attempts or a pending age over 15 minutes is flagged without inventing an outcome.
+
+Reservations expire after five minutes only before payment initiation. Initiated or unknown payments retain inventory and coupon holds until reconciliation. Run one attempt directly with:
+
+```sh
+docker compose run --rm worker python manage.py run_worker --once --attempt-id UUID
+```
+
+`make demo` pauses the regular worker and demonstrates success, definitive payment failure, pre-initiation expiry, a lost provider response, failed confirmation, and failed failure-finalization. It then runs recovery and restores the worker.
+
+## Data and operating limits
+
+Application data uses `default`; fake-provider data uses `payments`. Cross-database foreign keys are prohibited. Inventory is represented by individual rows and allocated in a short transaction using `SKIP LOCKED` plus bounded waiting. Reports use one read-only repeatable-read snapshot.
+
+This is a focused 4–6-hour assignment implementation. Deferred scope includes authentication, product administration, real payment integration, refunds, multiple payment attempts, multiple warehouses/currencies, coupon stacking/expiry, and measured throughput tuning. See [DECISIONS.md](DECISIONS.md) and [EDGE_CASES.md](EDGE_CASES.md).
+
+If readiness returns 503, inspect `docker compose logs db api` and confirm both databases exist. Rebuild with `docker compose build` after dependency or image configuration changes.

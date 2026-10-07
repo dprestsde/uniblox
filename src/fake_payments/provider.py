@@ -33,6 +33,15 @@ class FakePaymentProvider:
             return PaymentResult(PaymentStatus.NOT_FOUND)
         return self._result(payment)
 
+    def configure(self, attempt_id, amount_minor, currency, outcome, *, lose_response_once=False):
+        return FakePayment.objects.using("payments").create(
+            attempt_id=attempt_id,
+            amount_cents=amount_minor,
+            currency=currency,
+            outcome=outcome,
+            lose_response_once=lose_response_once,
+        )
+
     @staticmethod
     def _result(payment):
         status = (

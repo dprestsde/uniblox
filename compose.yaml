@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+    environment:
+      POSTGRES_USER: ${DB_USER:-uniblox}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-uniblox-local-only}
+      POSTGRES_DB: ${DB_NAME:-uniblox}
+      PAYMENTS_DB_NAME: ${PAYMENTS_DB_NAME:-uniblox_payments}
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./docker/init-payments-db.sh:/docker-entrypoint-initdb.d/init-payments-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  api:
+    build: .
+    env_file: .env
+    environment:
+      PYTHONPATH: /app/src
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+  worker:
+    build: .
+    command: ["python", "manage.py", "run_worker"]
+    env_file: .env
+    environment:
+      PYTHONPATH: /app/src
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+    depends_on:
+      db:
+        condition: service_healthy
+    stop_grace_period: 15s
+volumes:
+  pgdata:

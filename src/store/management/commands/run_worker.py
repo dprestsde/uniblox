@@ -6,7 +6,7 @@ import threading
 from django.core.management.base import BaseCommand, CommandError
 from django.db import DatabaseError, connections
 
-from store.services.worker import run_cycle
+from store.services.payment import PaymentService
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +34,11 @@ class Command(BaseCommand):
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous[signum] = signal.signal(signum, stop)
         logger.info("worker_started")
+        payment_service = PaymentService()
         try:
             while not stopping.is_set():
                 try:
-                    outcomes = run_cycle(attempt_id=options["attempt_id"])
+                    outcomes = payment_service.run_cycle(attempt_id=options["attempt_id"])
                 except DatabaseError as exc:
                     logger.exception(
                         "worker_cycle_database_error", extra={"operation": "payment_cycle"}

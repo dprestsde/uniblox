@@ -203,10 +203,10 @@ def active_cart(request, customer_id):
 def cart_items(request, customer_id):
     quantity = _positive_int(request.data.get("quantity"))
     product_id = _uuid(request.data.get("product_id"), "product")
-    item, replayed = add_cart_item(
+    snapshot, replayed = add_cart_item(
         _uuid(customer_id, "customer"), product_id, quantity, require_idempotency_key(request)
     )
-    return Response(cart_data(item.cart), status=200 if replayed else 201)
+    return Response(snapshot, status=200 if replayed else 201)
 
 
 @api_view(["GET"])

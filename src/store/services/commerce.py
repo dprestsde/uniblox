@@ -60,6 +60,27 @@ def available_quantity(product_id):
     ).count()
 
 
+def open_cart_snapshot(cart):
+    items = [
+        {
+            "product_id": str(item.product_id),
+            "name": item.product.name,
+            "quantity": item.quantity,
+            "unit_price_cents": item.product.price_cents,
+            "line_total_cents": item.product.price_cents * item.quantity,
+        }
+        for item in cart.items.select_related("product").order_by("product_id")
+    ]
+    return {
+        "id": str(cart.id),
+        "customer_id": str(cart.customer_id),
+        "status": cart.status,
+        "currency": "USD",
+        "subtotal_cents": sum(item["line_total_cents"] for item in items),
+        "items": items,
+    }
+
+
 def get_or_create_open_cart(customer):
     cart = Cart.objects.filter(customer=customer, status=Cart.Status.OPEN).first()
     if cart:
@@ -79,9 +100,13 @@ def add_cart_item(customer_id, product_id, quantity, key):
             raise DomainError("customer_not_found", "Customer not found.", status=404)
         replay = _replay("cart.add", scope, key, request_fingerprint)
         if replay:
-            return CartItem.objects.select_related("cart", "product").get(
-                id=replay.resource_id
-            ), True
+            if replay.response_snapshot:
+                return replay.response_snapshot, True
+            raise DomainError(
+                "idempotency_result_unavailable",
+                "The committed result for this legacy idempotency key is unavailable.",
+                status=409,
+            )
         product = Product.objects.filter(id=product_id).first()
         if not product:
             raise DomainError("product_not_found", "Product not found.", status=404)
@@ -105,6 +130,7 @@ def add_cart_item(customer_id, product_id, quantity, key):
             item.save(update_fields=["quantity"])
         else:
             item = CartItem.objects.create(cart=cart, product=product, quantity=quantity)
+        response_snapshot = open_cart_snapshot(cart)
         IdempotencyRecord.objects.create(
             operation="cart.add",
             scope=scope,
@@ -112,9 +138,10 @@ def add_cart_item(customer_id, product_id, quantity, key):
             request_fingerprint=request_fingerprint,
             resource_type="cart_item",
             resource_id=item.id,
-            response_status=200,
+            response_status=201,
+            response_snapshot=response_snapshot,
         )
-        return item, False
+        return response_snapshot, False
 
 
 def set_cart_item(cart_id, product_id, quantity):
@@ -253,7 +280,14 @@ def _allocate_order(cart_id, coupon_code, key, request_fingerprint, *, wait_for_
             coupon.save(update_fields=["status", "owner_order"])
         cart.status = Cart.Status.CHECKOUT_STARTED
         cart.save(update_fields=["status", "updated_at"])
-        PaymentAttempt.objects.create(order=order, next_retry_at=timezone.now())
+        attempt_values = {"order": order, "next_retry_at": timezone.now()}
+        if net == 0:
+            attempt_values.update(
+                outcome=PaymentAttempt.Outcome.SUCCEEDED,
+                initiated_at=timezone.now(),
+                provider_reference="zero-total",
+            )
+        PaymentAttempt.objects.create(**attempt_values)
         IdempotencyRecord.objects.create(
             operation="checkout",
             scope=str(cart.id),
@@ -262,6 +296,7 @@ def _allocate_order(cart_id, coupon_code, key, request_fingerprint, *, wait_for_
             resource_type="order",
             resource_id=order.id,
             response_status=202,
+            response_snapshot={},
         )
         return order, False
 
@@ -276,11 +311,6 @@ def checkout(cart_id, coupon_code, key):
                 cart_id, coupon_code, key, request_fingerprint, wait_for_locks=wait_for_locks
             )
             if order.net_cents == 0 and order.status == Order.Status.PENDING:
-                PaymentAttempt.objects.filter(order=order).update(
-                    outcome=PaymentAttempt.Outcome.SUCCEEDED,
-                    initiated_at=timezone.now(),
-                    provider_reference="zero-total",
-                )
                 finalize_order(order.id, succeeded=True)
                 order.refresh_from_db()
             return order, replayed
@@ -305,6 +335,12 @@ def checkout(cart_id, coupon_code, key):
 
 def finalize_order(order_id, *, succeeded, failure_code="payment_failed", fault=None):
     with transaction.atomic():
+        customer_id = (
+            Order.objects.filter(id=order_id).values_list("customer_id", flat=True).first()
+        )
+        if not customer_id:
+            raise Order.DoesNotExist(order_id)
+        Customer.objects.select_for_update().get(id=customer_id)
         order = Order.objects.select_for_update().get(id=order_id)
         if order.status != Order.Status.PENDING:
             expected = Order.Status.CONFIRMED if succeeded else Order.Status.FAILED
@@ -387,5 +423,6 @@ def generate_coupon(key):
             resource_type="coupon",
             resource_id=coupon.id,
             response_status=201,
+            response_snapshot={},
         )
         return coupon, False

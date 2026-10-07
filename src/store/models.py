@@ -235,6 +235,7 @@ class IdempotencyRecord(models.Model):
     resource_type = models.CharField(max_length=40)
     resource_id = models.UUIDField()
     response_status = models.PositiveSmallIntegerField()
+    response_snapshot = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

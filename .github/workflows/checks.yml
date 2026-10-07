@@ -1,0 +1,25 @@
+name: checks
+on:
+  push:
+  pull_request:
+jobs:
+  foundation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up and test Compose stack
+        run: |
+          make setup
+          make up
+          make check
+          make lint
+          make test
+          make worker-once
+          curl --fail --silent http://127.0.0.1:8000/health/live
+          curl --fail --silent http://127.0.0.1:8000/health/ready
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --no-color api worker db
+      - name: Stop services
+        if: always()
+        run: docker compose down

@@ -24,13 +24,15 @@ This is the acceptance map for `task.md`. `tests/test_commerce.py` uses PostgreS
 | Rewards | Only confirmed orders qualify; generation is keyed and replays one milestone | `test_reward_rounding_generation_and_report` |
 | Money | Integer cents, order-level half-up boundary, historical totals, balanced report revenue | `test_half_up_rounding_is_applied_once_to_subtotal`, report test |
 | Reporting | Confirmed-only revenue and quantities, coupon accounting, no read mutation | `test_reward_rounding_generation_and_report` |
-| Database routing | Provider and application aliases use distinct databases and routing | `DatabaseConfigurationTests` |
+| Product rename reporting | Multiple historical names aggregate once by product ID and display the current catalog name | `test_report_aggregates_renamed_product_by_id_with_current_name` |
+| Database routing | Provider and application aliases use distinct databases and routing | `DatabaseTests` |
 | API errors/logs | Malformed and unknown API paths use JSON; unexpected failures are hidden from clients; logs retain safe diagnostics | `test_api_fallbacks_return_json_envelopes`, `test_unexpected_exception_is_logged_and_hidden`, `test_json_logs_include_safe_context_and_exception` |
 | Health/worker | Readiness fails generically; continuous mode recovers from a database error; one-cycle mode fails visibly | `test_readiness_hides_database_errors`, `test_continuous_worker_recovers_after_database_failure`, `test_once_worker_reports_database_failure`, `make worker-once` |
-| Serializer input | Unknown/read-only fields, malformed UUIDs, booleans, fractions, nonpositive quantities, invalid pagination, and missing keys fail before service calls | `SerializerTests` |
+| Serializer input | Unknown/read-only fields, non-object bodies, malformed UUIDs, booleans, fractions, nonpositive quantities, invalid pagination, and missing keys fail before service calls | `SerializerTests`, `ApiArchitectureTests.test_non_object_json_bodies_return_validation_errors`, `test_invalid_pagination_returns_field_errors` |
+| Input-source ownership | Body fields owned by paths or `Idempotency-Key` cannot override trusted values | `ApiArchitectureTests.test_body_cannot_override_path_or_idempotency_header` |
 | Service delegation | Command serializer `.save()` invokes the injected service with normalized validated values | `SerializerTests` |
-| Output contracts | Nested DTOs are response-validated; invalid service output is logged and returned as a safe 500 | `ApiArchitectureTests.test_invalid_service_output_returns_safe_internal_error` |
-| API compatibility | APIViews preserve customer, product, cart, order, coupon, report, replay, and error contracts | `ApiArchitectureTests`, `test_public_read_and_cart_endpoints_preserve_contracts` |
+| Output contracts | Service DTOs are response-validated; invalid output is logged and returned as a safe 500 | `ApiArchitectureTests.test_invalid_service_output_returns_safe_internal_error` |
+| API compatibility | APIViews preserve customer, product, cart, order, coupon, report, replay, and error contracts | `ApiArchitectureTests`, `test_read_and_cart_creation_endpoints_preserve_contracts` |
 | Layer boundary | API views and runtime commands have no direct model or transaction access; legacy procedural service modules are absent | `ApiArchitectureTests.test_runtime_entrypoints_do_not_use_orm_or_transactions` |
 
 ## Enforced by service and database constraints

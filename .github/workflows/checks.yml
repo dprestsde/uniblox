@@ -14,6 +14,7 @@ jobs:
           make check
           make lint
           make test
+          make api-smoke
           make worker-once
           curl --fail --silent http://127.0.0.1:8000/health/live
           curl --fail --silent http://127.0.0.1:8000/health/ready

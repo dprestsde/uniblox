@@ -6,7 +6,7 @@
 
 ## Build, Test, and Development Commands
 
-Run `make setup` once to create `.env`, build images, migrate both databases, and seed demo data. Use `make up`, `make down`, and `make logs` for daily development. `make check` runs Django checks and migration-drift detection. `make lint` checks Ruff lint and formatting; `make format` applies formatting. `make test` runs the suite against isolated PostgreSQL databases. `make demo` exercises payment and local-finalization recovery; `make worker-once` drains one worker batch.
+Run `make setup` once to create `.env`, build images, migrate both databases, and seed demo data. Use `make up`, `make down`, and `make logs` for daily development. `make check` runs Django checks and migration-drift detection. `make lint` checks Ruff lint and formatting; `make format` applies formatting. `make test` runs the suite against isolated PostgreSQL databases. `make api-smoke` calls every API against a running seeded stack and consumes one unit. `make demo` exercises payment and local-finalization recovery; `make worker-once` drains one worker batch.
 
 ## Coding Style & Naming Conventions
 

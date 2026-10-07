@@ -92,7 +92,7 @@ Cart additions increase the existing line and reject a resulting quantity above 
 
 **Options considered:** Generate coupons during checkout, derive them on read, or use an administrator action protected by the reward-program row.
 
-**Choice:** Seed immutable defaults `n=5`, `x=10`. A keyed administrator action locks the program, counts confirmed orders, and creates the oldest missing eligible milestone under a unique program/milestone constraint. Reports run their aggregates in a read-only Repeatable Read transaction and use order snapshots.
+**Choice:** Seed immutable defaults `n=5`, `x=10`. A keyed administrator action locks the program, counts confirmed orders, and creates the oldest missing eligible milestone under a unique program/milestone constraint. Reports run their aggregates in a read-only Repeatable Read transaction, use order snapshots for money, aggregate quantities by product ID, and display the current catalog name.
 
 **Why:** Generation remains explicit as required, missed milestones remain recoverable, and all report values share one database snapshot.
 
@@ -102,7 +102,7 @@ Cart additions increase the existing line and reject a resulting quantity above 
 
 **Context:** Request validation, HTTP behavior, and database coordination need clear ownership that can be tested independently.
 
-**Choice:** Route every endpoint through an explicit DRF `APIView`, plain command and response serializers, then an injected class-based service. Command serializers validate body, path, query, and header values and delegate from `create()` or `update()`. Response serializers validate service DTOs. Services own all ORM access, transactions, locks, and database-dependent validation; workers and commands call the same services. Service errors are framework-independent.
+**Choice:** Route every endpoint through an explicit DRF `APIView`, plain command and response serializers, then an injected class-based service. Body, path, query, and header sources are validated separately; trusted path/header values are passed to command serializers through `.save()`. Body fields owned by another source are rejected. Response serializers validate service DTOs. Services own all ORM access, transactions, locks, and database-dependent validation; workers and commands call the same services. Service errors are framework-independent.
 
 **Why:** Client-controlled values fail before persistence, output contracts cannot silently drift, and all entry points reuse the same concurrency-safe behavior.
 

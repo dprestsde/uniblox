@@ -16,6 +16,8 @@ dev = ["ruff>=0.13,<1"]
 line-length = 100
 target-version = "py313"
 src = ["src", "tests"]
+extend-exclude = ["src/store/migrations", "src/fake_payments/migrations"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

@@ -13,6 +13,8 @@ from rest_framework.test import APIClient
 from config.db_router import DatabaseRouter
 from config.errors import json_exception_handler
 from config.logging import JsonFormatter
+from store.models import InventoryUnit, Product
+from store.services.demo import DEFAULT_PRODUCTS, DemoDataService
 
 
 class HealthTests(SimpleTestCase):
@@ -76,6 +78,26 @@ class HealthTests(SimpleTestCase):
         self.assertEqual(payload["attempt_id"], "attempt-123")
         self.assertEqual(payload["operation"], "finalize")
         self.assertIn("ValueError: diagnostic detail", payload["exception"])
+
+
+class DemoInventoryResetTests(TestCase):
+    def test_reset_restores_default_available_quantities(self):
+        service = DemoDataService()
+        service.seed()
+        first_name, _, _ = DEFAULT_PRODUCTS[0]
+        second_name, _, _ = DEFAULT_PRODUCTS[1]
+        first = Product.objects.get(name=first_name)
+        second = Product.objects.get(name=second_name)
+        InventoryUnit.objects.filter(product=first).delete()
+        InventoryUnit.objects.bulk_create([InventoryUnit(product=second) for _ in range(3)])
+
+        service.reset_inventory()
+
+        for name, _, expected in DEFAULT_PRODUCTS:
+            available = InventoryUnit.objects.filter(
+                product__name=name, status=InventoryUnit.Status.AVAILABLE
+            ).count()
+            self.assertEqual(available, expected)
 
 
 class WorkerCommandTests(SimpleTestCase):

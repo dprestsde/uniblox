@@ -25,6 +25,7 @@ make demo         # run payment failure and recovery demonstrations
 | --- | --- |
 | `make migrate` | Apply migrations to application and provider databases |
 | `make seed` | Idempotently create two customers, five products, scarce stock, and rewards |
+| `make reset-inventory` | Restore available stock for the five seeded products while preserving orders and reservations |
 | `make check` | Run Django and migration-drift checks |
 | `make lint` / `make format` | Check or apply Ruff rules |
 | `make test` | Run tests in isolated PostgreSQL databases |
@@ -32,7 +33,7 @@ make demo         # run payment failure and recovery demonstrations
 | `make worker-once` | Process at most ten due payment attempts and exit |
 | `make logs` | Follow API and worker JSON logs |
 
-The equivalent pattern is `docker compose run --rm api python manage.py <command>`. For example, `make seed` runs `docker compose run --rm api python manage.py seed_demo`.
+The equivalent pattern is `docker compose run --rm api python manage.py <command>`. For example, `make seed` runs `docker compose run --rm api python manage.py seed_demo`. To replenish the stable demo products after manual API testing, run `make reset-inventory`; this restores their available quantities to 3, 5, 2, 4, and 1 without changing sold or reserved units.
 
 ## API contracts
 

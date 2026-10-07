@@ -1,4 +1,4 @@
-.PHONY: setup up down logs migrate check lint format test worker-once seed demo api-smoke
+.PHONY: setup up down logs migrate check lint format test worker-once seed reset-inventory demo api-smoke
 
 setup:
 	@docker info >/dev/null 2>&1 || (echo "Docker daemon unavailable. Start Docker Desktop and retry." >&2; exit 1)
@@ -40,6 +40,9 @@ worker-once:
 
 seed:
 	docker compose run --rm api python manage.py seed_demo
+
+reset-inventory:
+	docker compose run --rm api python manage.py reset_demo_inventory
 
 demo:
 	sh scripts/run-demo.sh

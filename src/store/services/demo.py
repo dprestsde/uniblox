@@ -19,6 +19,13 @@ from store.services.order import OrderService
 from store.services.payment import PaymentService
 
 NAMESPACE = uuid.UUID("7ed6db86-c7b1-4f1d-b4d0-7c66a45bf81b")
+DEFAULT_PRODUCTS = (
+    ("Mechanical Keyboard", 8900, 3),
+    ("Wireless Mouse", 4500, 5),
+    ("USB-C Hub", 6200, 2),
+    ("Laptop Stand", 5100, 4),
+    ("Scarce Monitor", 25900, 1),
+)
 
 
 class DemoDataService:
@@ -45,14 +52,7 @@ class DemoDataService:
                     id=self.stable_id(f"customer:{email}"),
                     defaults={"name": name, "email": email},
                 )
-            products = (
-                ("Mechanical Keyboard", 8900, 3),
-                ("Wireless Mouse", 4500, 5),
-                ("USB-C Hub", 6200, 2),
-                ("Laptop Stand", 5100, 4),
-                ("Scarce Monitor", 25900, 1),
-            )
-            for name, price, quantity in products:
+            for name, price, quantity in DEFAULT_PRODUCTS:
                 product, product_created = Product.objects.get_or_create(
                     id=self.stable_id(f"product:{name}"),
                     defaults={"name": name, "price_cents": price},
@@ -61,6 +61,35 @@ class DemoDataService:
                     InventoryUnit.objects.bulk_create(
                         [InventoryUnit(product=product) for _ in range(quantity)]
                     )
+
+    def reset_inventory(self):
+        """Restore available stock for stable demo products without altering order history."""
+        results = []
+        with transaction.atomic():
+            for name, price, target_quantity in DEFAULT_PRODUCTS:
+                product, _ = Product.objects.select_for_update().get_or_create(
+                    id=self.stable_id(f"product:{name}"),
+                    defaults={"name": name, "price_cents": price},
+                )
+                available_units = list(
+                    InventoryUnit.objects.select_for_update()
+                    .filter(product=product, status=InventoryUnit.Status.AVAILABLE)
+                    .order_by("id")
+                )
+                current_quantity = len(available_units)
+                if current_quantity < target_quantity:
+                    InventoryUnit.objects.bulk_create(
+                        [
+                            InventoryUnit(product=product)
+                            for _ in range(target_quantity - current_quantity)
+                        ]
+                    )
+                elif current_quantity > target_quantity:
+                    InventoryUnit.objects.filter(
+                        id__in=[unit.id for unit in available_units[target_quantity:]]
+                    ).delete()
+                results.append({"name": name, "available_quantity": target_quantity})
+        return results
 
 
 class DemoScenarioService:

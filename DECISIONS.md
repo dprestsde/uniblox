@@ -2,7 +2,7 @@
 
 Detailed rationale and earlier research live in [DECISION_CONTEXT.md](DECISION_CONTEXT.md). The initial implementation followed the assignment’s 4–6-hour timebox; the requested API architecture hardening was completed afterward.
 
-## Invariants and selected semantics
+## Invariants and ambiguities resolved
 
 - A customer has at most one open cart; checkout freezes it and allows a new cart.
 - One cart creates at most one order, reservation, and payment attempt. Add idempotency replays an immutable response snapshot; checkout replays the original order's current state.
@@ -12,7 +12,7 @@ Detailed rationale and earlier research live in [DECISION_CONTEXT.md](DECISION_C
 - Orders preserve product, price, coupon, gross, discount, and net snapshots; `gross - discount = net`.
 - Reward milestones count confirmed store-wide orders. Each program/milestone generates at most one coupon.
 
-Cart additions increase the existing line and reject a resulting quantity above current availability. Checkout rechecks availability. Current prices are frozen when the pending order is created. Failed orders are terminal. Authentication is omitted as permitted by `task.md`.
+An active-cart read returns 404 and never creates state; explicit cart creation or the first item addition creates the cart. Cart quantities express intent and do not reserve stock. Additions reject quantities already above visible availability, while checkout rechecks and reserves inventory. Open carts use current prices; checkout freezes current prices into the order. Failed orders are terminal, uncertain payments retain their holds, and rewards count confirmed orders store-wide. Authentication is omitted as permitted by `task.md`.
 
 ## Decision: Individual inventory units and durable reservations
 
@@ -102,6 +102,8 @@ Cart additions increase the existing line and reject a resulting quantity above 
 
 **Context:** Request validation, HTTP behavior, and database coordination need clear ownership that can be tested independently.
 
+**Options considered:** Function views with manual parsing, `ModelSerializer` classes that persist directly, or explicit `APIView` and plain serializers backed by domain services.
+
 **Choice:** Route every endpoint through an explicit DRF `APIView`, plain command and response serializers, then an injected class-based service. Body, path, query, and header sources are validated separately; trusted path/header values are passed to command serializers through `.save()`. Body fields owned by another source are rejected. Response serializers validate service DTOs. Services own all ORM access, transactions, locks, and database-dependent validation; workers and commands call the same services. Service errors are framework-independent.
 
 **Why:** Client-controlled values fail before persistence, output contracts cannot silently drift, and all entry points reuse the same concurrency-safe behavior.
@@ -112,7 +114,7 @@ Cart additions increase the existing line and reject a resulting quantity above 
 
 Errors use `{error: {code, message, retryable, details?}}`: 400 invalid input with field details, JSON 404 for malformed or unknown API paths, 409 stock/idempotency/state conflicts, 500 safe internal or output-contract errors, and 503 transient contention. Structured logs include request IDs, allowlisted attempt/operation/status context, and exception diagnostics while omitting request bodies, emails, coupon values, and credentials.
 
-Implemented: class-based API and service boundaries, strict input and output contracts, customer/cart/product reads, inventory reservation, checkout snapshots, independent fake payment, leased recovery, coupon reservation and generation, customer counts, reporting, health checks, stable seed data, and deterministic demos. Tests cover serializer delegation, architecture boundaries, API compatibility, immutable add replay, retries, last-unit and coupon competition, customer-first finalization locking, rollback, provider uncertainty, zero-total recovery, worker database outages, expiry, money, rewards, and reporting.
+Implemented: class-based API and service boundaries, strict input and output contracts, customer/cart/product reads, inventory reservation, checkout snapshots, independent fake payment, leased recovery, coupon reservation and generation, customer counts, reporting, health checks, stable seed data, and deterministic demos. Tests cover serializer delegation, architecture boundaries, API compatibility, immutable add replay, retries, last-unit and coupon competition, customer-first finalization locking, attempt-only worker locks, rollback, provider uncertainty, zero-total recovery, worker database outages, expiry, money, rewards, and reporting.
 
 Deferred: authentication, product administration, real payments, refunds, cancellation after initiation, multiple payment attempts, taxes/shipping, multiple currencies or warehouses, coupon stacking/expiry, archival, metrics dashboards, and load-tested tuning.
 
